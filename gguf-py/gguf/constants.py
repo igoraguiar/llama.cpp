@@ -4506,8 +4506,9 @@ class GGMLQuantizationType(IntEnum):
 
 
 class ExpertGatingFuncType(IntEnum):
-    SOFTMAX  = 1
-    SIGMOID  = 2
+    SOFTMAX       = 1
+    SIGMOID       = 2
+    SQRTSOFTPLUS  = 4
 
 
 # TODO: add GGMLFileType from ggml_ftype in ggml.h
