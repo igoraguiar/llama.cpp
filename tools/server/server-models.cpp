@@ -1423,6 +1423,12 @@ void server_models::load(const std::string & name, const load_options & opts) {
         std::vector<std::string> child_env  = base_env; // copy
         child_env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
 
+        // Inject per-model smithy config as SMITHY_CONFIG env var for the child
+        std::string smithy_path;
+        if (inst.meta.preset.get_option(COMMON_ARG_PRESET_SMITHY_CONFIG, smithy_path) && !smithy_path.empty()) {
+            child_env.push_back("SMITHY_CONFIG=" + smithy_path);
+        }
+
         if (opts.mode == SERVER_CHILD_MODE_DOWNLOAD) {
             inst.meta.status = SERVER_MODEL_STATUS_DOWNLOADING;
             child_env.push_back("LLAMA_SERVER_CHILD_MODE=download");

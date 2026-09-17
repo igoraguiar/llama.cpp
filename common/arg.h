@@ -10,6 +10,10 @@
 #include <cstring>
 #include <memory>
 
+// kernel-anvil (smithy): preset-only `smithy-config` key in models.ini; the
+// router injects it as SMITHY_CONFIG into the child's environment.
+#define COMMON_ARG_PRESET_SMITHY_CONFIG "__PRESET_SMITHY_CONFIG"
+
 // pseudo-env variable to identify preset-only arguments
 #define COMMON_ARG_PRESET_LOAD_ON_STARTUP    "__PRESET_LOAD_ON_STARTUP"
 #define COMMON_ARG_PRESET_STOP_TIMEOUT       "__PRESET_STOP_TIMEOUT"

@@ -4808,6 +4808,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 void common_params_add_preset_options(std::vector<common_arg> & args) {
     // arguments below won't be treated as CLI args, only preset options
     args.push_back(common_arg(
+        {"smithy-config"}, "PATH",
+        "in server router mode, kernel-anvil per-model MMVQ config JSON, injected as SMITHY_CONFIG into the child process",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env(COMMON_ARG_PRESET_SMITHY_CONFIG).set_preset_only());
+
+    args.push_back(common_arg(
         {"load-on-startup"}, "NAME",
         "in server router mode, autoload this model on startup",
         [](common_params &, const std::string &) { /* unused */ }
