@@ -1573,7 +1573,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
     switch (ncols_dst) {
         case 1: case 2: case 3: case 4: case 5: case 6: case 7: case 8: {
             // dispatch per ncols with a compile-time tag
-            const auto dispatch = [&](auto ncols_tag) {
+            const auto dispatch = [&](auto ncols_tag, int rpb_override = 0) {
                 constexpr int c_ncols_dst = decltype(ncols_tag)::value;
 
                 // Tag types keep the flags compile-time, so __launch_bounds__ matches what is launched.
@@ -1623,7 +1623,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
                         ? calc_nwarps(type, c_ncols_dst, table_id) * warp_size * get_vdr_mmvq(type) / qi_type
                         : 0;
                     int rpb = 1;
-                    if (blocks_per_row_x > 0 && n_groups > 0 && blocks_per_row_x < n_groups) {
+                    if (rpb_override > 1) {
+                        rpb = rpb_override;
+                    } else if (blocks_per_row_x > 0 && n_groups > 0 && blocks_per_row_x < n_groups) {
                         // fill the groups (ceil) and kill the j-dependence (n_groups/gcd)
                         int fill = (n_groups + blocks_per_row_x - 1) / blocks_per_row_x;
                         int a = blocks_per_row_x, b = n_groups;
@@ -1665,6 +1667,17 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     // (pre-block-13 geometry) instead.
                     constexpr int c_ncols_dst = 1;
                     if (table_id >= MMVQ_PARAMETERS_RDNA2) {
+                        // kernel-anvil (smithy): a profiled rows_per_block wins over
+                        // both the ksplit shortcut and the dispatch fill heuristic.
+                        const smithy_shape_config scfg = smithy_lookup(type, nrows_x, ncols_x);
+                        if (scfg.rows_per_block > 1) {
+                            int rpb = 1;
+                            while (2*rpb <= scfg.rows_per_block && rpb < 16) {
+                                rpb <<= 1;
+                            }
+                            dispatch(std::integral_constant<int, 1>{}, rpb);
+                            break;
+                        }
                         if (ncols_x >= 4096) {
                             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
                             mul_mat_vec_q_switch_fusion_ksplit<type, c_ncols_dst>(
