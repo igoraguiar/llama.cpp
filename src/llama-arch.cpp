@@ -365,6 +365,14 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_DFLASH_SELECTOR_TOP_K,   "%s.selector_top_k"   },
 
     { LLM_KV_SHORTCONV_L_CACHE, "%s.shortconv.l_cache" },
+
+    // qcorr residual corrector. These keys are NOT arch-prefixed (like the xielu.* keys below):
+    // the corrector is packed onto an already-converted GGUF by an external tool
+    // (the Opti packer), which namespaces everything it adds under "corr.".
+    { LLM_KV_CORRECTOR_HIDDEN_SIZE,      "corr.hidden_size"      },
+    { LLM_KV_CORRECTOR_CONV_KERNEL,      "corr.conv_kernel"      },
+    { LLM_KV_CORRECTOR_EMBEDDING_LENGTH, "corr.embedding_length" },
+
     // sentence-transformers dense modules feature dims
     { LLM_KV_DENSE_2_FEAT_IN,        "%s.dense_2_feat_in"  },
     { LLM_KV_DENSE_2_FEAT_OUT,       "%s.dense_2_feat_out" },
@@ -696,6 +704,16 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_DFLASH_SELECTOR_PREV,                   "selector_predecessor" },
     { LLM_TENSOR_DFLASH_SELECTOR_NEXT,                   "selector_successor" },
     { LLM_TENSOR_DFLASH_SELECTOR_HIDDEN,                 "selector_hidden" },
+
+    // qcorr residual corrector. corr_norm_mu / corr_norm_sd carry no .weight/.bias suffix
+    // because they are not a norm's affine pair: they are the raw per-channel mean and
+    // standard deviation of the trained corrector's input whitening.
+    { LLM_TENSOR_CORR_NORM_MU,                           "blk.%d.corr_norm_mu" },
+    { LLM_TENSOR_CORR_NORM_SD,                           "blk.%d.corr_norm_sd" },
+    { LLM_TENSOR_CORR_CONV,                              "blk.%d.corr_conv" },
+    { LLM_TENSOR_CORR_UP,                                "blk.%d.corr_up" },
+    { LLM_TENSOR_CORR_DOWN,                              "blk.%d.corr_down" },
+    { LLM_TENSOR_CORR_GATE,                              "blk.%d.corr_gate" },
 };
 
 // declare information about the model weight tensors:
@@ -986,6 +1004,19 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_DFLASH_SELECTOR_PREV,       {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
     {LLM_TENSOR_DFLASH_SELECTOR_NEXT,       {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
     {LLM_TENSOR_DFLASH_SELECTOR_HIDDEN,     {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+
+    // qcorr residual corrector. The op here only drives buffer-type selection, so it must be
+    // the op the graph actually applies the tensor with:
+    //   mu  -> ggml_sub, sd -> ggml_div  (the graph computes (h - mu) / sd literally)
+    //   conv-> ggml_ssm_conv             (needs a 2-D [K, n_embd] weight, hence
+    //                                     TENSOR_ALLOW_RESHAPE at the create_tensor site)
+    //   up / down / gate -> ggml_mul_mat, with ".bias" auto-mapped to GGML_OP_ADD by the loader
+    {LLM_TENSOR_CORR_NORM_MU,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_SUB}},
+    {LLM_TENSOR_CORR_NORM_SD,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_DIV}},
+    {LLM_TENSOR_CORR_CONV,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_SSM_CONV}},
+    {LLM_TENSOR_CORR_UP,                    {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_CORR_DOWN,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_CORR_GATE,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
 };
 
 LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}

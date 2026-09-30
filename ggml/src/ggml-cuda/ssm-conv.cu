@@ -153,7 +153,12 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
         case 5:  launch_kernel(std::integral_constant<int, 5 >{}); break;
         case 9:  launch_kernel(std::integral_constant<int, 9 >{}); break;
         case 15: launch_kernel(std::integral_constant<int, 15>{}); break;
-        default: GGML_ABORT("Only support kernel sizes 3, 4, 5, 9, 15 right now.");
+        // 16 is the qcorr residual corrector's depthwise kernel width. The long-token path needs
+        // threads*(kNC-1+split_n_t)*sizeof(float) = 128*(15+32)*4 = 24064 B of shared memory,
+        // well under the 48 KB default; the short-token path only adds one more register.
+        // Verified on sm_86 / sm_89 (RTX 3090, RTX 4090, L40S) and sm_90 (H100).
+        case 16: launch_kernel(std::integral_constant<int, 16>{}); break;
+        default: GGML_ABORT("Only support kernel sizes 3, 4, 5, 9, 15, 16 right now.");
     }
 }
 

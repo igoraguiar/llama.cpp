@@ -324,6 +324,14 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     quantize &= name.find("ssm_conv1d") == std::string::npos;
     quantize &= name.find("shortconv.conv.weight") == std::string::npos;
 
+    // the qcorr corrector's depthwise conv MUST stay F32 -- every backend asserts it
+    // (ggml-metal-device.cpp, ssm-conv.cu, ggml-cpu/ops.cpp) -- and it is only [K, n_embd].
+    // corr_gate.weight is [n_embd, 1], which ggml_n_dims already reports as 1-D so the
+    // "< 2 dims" bail above catches it; the explicit skip keeps that true if the packer ever
+    // stores it differently. corr_up / corr_down are the two that SHOULD quantize.
+    quantize &= name.find("corr_conv.weight") == std::string::npos;
+    quantize &= name.find("corr_gate.weight") == std::string::npos;
+
     // do not quantize MiniMax's indexer projection weights, they are tiny
     quantize &= name.find("indexer.k_proj.weight") == std::string::npos;
     quantize &= name.find("indexer.q_proj.weight") == std::string::npos;

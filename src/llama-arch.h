@@ -411,6 +411,11 @@ enum llm_kv {
 
     LLM_KV_SHORTCONV_L_CACHE,
 
+    // qcorr residual corrector; arch-independent keys, written by the Opti packer
+    LLM_KV_CORRECTOR_HIDDEN_SIZE,
+    LLM_KV_CORRECTOR_CONV_KERNEL,
+    LLM_KV_CORRECTOR_EMBEDDING_LENGTH,
+
     LLM_KV_XIELU_ALPHA_N,
     LLM_KV_XIELU_ALPHA_P,
     LLM_KV_XIELU_BETA,
@@ -703,6 +708,15 @@ enum llm_tensor {
     LLM_TENSOR_DFLASH_SELECTOR_PREV,
     LLM_TENSOR_DFLASH_SELECTOR_NEXT,
     LLM_TENSOR_DFLASH_SELECTOR_HIDDEN,
+
+    // qcorr residual corrector, one group per trunk layer. Names and dimension order are
+    // fixed by the Opti packer; see llama_model_qwen35::load_arch_tensors.
+    LLM_TENSOR_CORR_NORM_MU,
+    LLM_TENSOR_CORR_NORM_SD,
+    LLM_TENSOR_CORR_CONV,
+    LLM_TENSOR_CORR_UP,
+    LLM_TENSOR_CORR_DOWN,
+    LLM_TENSOR_CORR_GATE,
 };
 
 

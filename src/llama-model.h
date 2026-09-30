@@ -217,6 +217,25 @@ struct llama_layer_shortconv {
     struct ggml_tensor * out_proj = nullptr;
 };
 
+// qcorr residual corrector, one per trunk layer. Applied to the finished layer output h:
+//   x   = (h - mu) / sd
+//   xm  = x + depthwise_causal_conv1d(x, conv)          (K taps, per channel, no bias)
+//   y   = gelu_erf(xm @ up^T + up_b) @ down^T + down_b
+//   out = h + sigmoid(x @ gate^T + gate_b) * y          (the gate reads x, not xm)
+// ne comments below are the ggml ne order (ne[0] fastest), which is the reverse of the
+// PyTorch/NumPy shape the Opti packer writes for these tensors.
+struct llama_layer_corrector {
+    struct ggml_tensor * norm_mu = nullptr;  // per-channel mean                ne [n_embd]
+    struct ggml_tensor * norm_sd = nullptr;  // per-channel standard deviation  ne [n_embd]
+    struct ggml_tensor * conv    = nullptr;  // depthwise causal conv           ne [K, n_embd]
+    struct ggml_tensor * up      = nullptr;  //                                 ne [n_embd, H]
+    struct ggml_tensor * up_b    = nullptr;  //                                 ne [H]
+    struct ggml_tensor * down    = nullptr;  //                                 ne [H, n_embd]
+    struct ggml_tensor * down_b  = nullptr;  //                                 ne [n_embd]
+    struct ggml_tensor * gate    = nullptr;  //                                 ne [n_embd, 1]
+    struct ggml_tensor * gate_b  = nullptr;  //                                 ne [1]
+};
+
 struct llama_layer_nextn {
     struct ggml_tensor * eh_proj               = nullptr;
     struct ggml_tensor * eh_proj_s             = nullptr;
@@ -587,6 +606,8 @@ struct llama_layer {
     struct llama_layer_convnext convnext;
 
     struct llama_layer_shortconv shortconv;
+
+    struct llama_layer_corrector corr;
 
     struct llama_layer_nextn nextn;
 

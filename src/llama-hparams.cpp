@@ -282,6 +282,38 @@ bool llama_hparams::is_ple(uint32_t il) const {
     GGML_ABORT("%s: il (%u) out of bounds (n_layer_all: %u)\n", __func__, il, n_layer_all);
 }
 
+uint32_t llama_hparams::corr_conv_state() const {
+    if (corr_conv_k <= 1) {
+        return 0;
+    }
+
+    // the depthwise causal conv needs K-1 past columns of the normalized hidden state
+    return (corr_conv_k - 1) * n_embd;
+}
+
+uint32_t llama_hparams::corr_hidden(uint32_t il) const {
+    // the corrector only covers the trunk; MTP/NextN blocks (il >= n_layer()) never have one
+    return il < n_layer() ? corr_hidden_arr[il] : 0;
+}
+
+bool llama_hparams::has_corr(uint32_t il) const {
+    return corr_conv_k > 1 && corr_hidden(il) > 0;
+}
+
+bool llama_hparams::has_any_corr() const {
+    if (corr_conv_k <= 1) {
+        return false;
+    }
+
+    for (uint32_t il = 0; il < n_layer(); ++il) {
+        if (corr_hidden_arr[il] > 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 uint32_t llama_hparams::n_pos_per_embd() const {
     return rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE ? 4 : 1;
 }

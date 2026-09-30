@@ -1277,6 +1277,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     std::fill(hparams.n_head_kv_arr.begin(),    hparams.n_head_kv_arr.end(),    0);
     std::fill(hparams.n_ff_arr.begin(),         hparams.n_ff_arr.end(),         0);
     std::fill(hparams.n_ff_exp_arr.begin(),     hparams.n_ff_exp_arr.end(),     0);
+    // no corrector unless the arch loader finds the corr.* keys
+    std::fill(hparams.corr_hidden_arr.begin(),  hparams.corr_hidden_arr.end(),  0);
 
     std::fill(hparams.rope_sections.begin(), hparams.rope_sections.end(), 0);
     std::fill(hparams.rope_pattern.begin(),  hparams.rope_pattern.end(), 1);

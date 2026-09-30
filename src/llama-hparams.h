@@ -95,6 +95,14 @@ struct llama_hparams {
 
     uint32_t n_shortconv_l_cache  = 0;
 
+    // qcorr residual corrector (written into the GGUF by the Opti packer).
+    // `corr.conv_kernel` is the depthwise causal kernel width K; `corr.hidden_size` is the
+    // per-layer bottleneck width H, where 0 means "this layer carries no corrector".
+    // Both keys are absent from an ordinary GGUF, which leaves K = 0 and has_corr(il) false
+    // everywhere, so the entire feature is inert on unmodified models.
+    uint32_t corr_conv_k = 0;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> corr_hidden_arr;
+
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_kv_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_ff_arr;
@@ -320,6 +328,16 @@ struct llama_hparams {
 
     // PLE conv history rows: (kernel - 1) * ngram_size; 0 without a PLE module
     uint32_t ple_conv_state() const;
+
+    // qcorr corrector conv history: (K - 1) * n_embd floats per cell; 0 without a corrector.
+    // This is deliberately NOT folded into n_embd_r(): the corrector lives on every trunk
+    // layer, including the full-attention ones that have no r_l / s_l row at all.
+    uint32_t corr_conv_state() const;
+    // the corrector bottleneck width of layer `il`, 0 if that layer has none
+    uint32_t corr_hidden(uint32_t il) const;
+    bool     has_corr(uint32_t il) const;
+    // true if ANY trunk layer carries a corrector
+    bool     has_any_corr() const;
 
     // qwen3vl deepstack
     // When parsed from GGUF, this implies the first N layers consume the first

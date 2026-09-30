@@ -962,6 +962,12 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
                 ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[0], w->ne[1], w->ne[2], w->ne[3]);
                 op_tensor = ggml_add(ctx, a, w);
             } break;
+        case GGML_OP_SUB:
+            {
+                // used by the qcorr corrector's per-channel mean (h - mu)
+                ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[0], w->ne[1], w->ne[2], w->ne[3]);
+                op_tensor = ggml_sub(ctx, a, w);
+            } break;
         case GGML_OP_ADD_ID:
             {
                 const int n_expert_used = hparams.n_expert_used_max();

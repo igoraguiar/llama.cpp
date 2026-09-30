@@ -51,8 +51,11 @@ llama_memory_recurrent::llama_memory_recurrent(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                // r and s per layer, plus the separate PLE conv row where the model has one
-                /*.mem_size   =*/ size_t((hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer*ggml_tensor_overhead()),
+                // r and s per layer, plus the separate PLE conv row where the model has one,
+                // plus the separate qcorr corrector conv row where the model has one
+                /*.mem_size   =*/ size_t(((hparams.ple_conv_state()  > 0 ? 1u : 0u) +
+                                          (hparams.corr_conv_state() > 0 ? 1u : 0u) +
+                                          2u)*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -73,9 +76,15 @@ llama_memory_recurrent::llama_memory_recurrent(
     r_l.resize(n_layer);
     s_l.resize(n_layer);
     p_l.resize(n_layer);
+    c_l.resize(n_layer);
 
     for (int i = 0; i < n_layer; i++) {
-        if (filter && !filter(i)) {
+        // the qcorr corrector runs on every trunk layer, so a layer the recurrent filter rejects
+        // may still need a c_l row. Only r_l / s_l / p_l stay behind the filter.
+        const bool in_filter = !filter || filter(i);
+        const bool want_corr = hparams.corr_conv_state() > 0 && hparams.has_corr(i);
+
+        if (!in_filter && !want_corr) {
             LLAMA_LOG_DEBUG("%s: layer %3d: skipped\n", __func__, i);
             continue;
         }
@@ -99,18 +108,27 @@ llama_memory_recurrent::llama_memory_recurrent(
         }
 
         const uint32_t n_rows = mem_size * (1 + n_rs_seq);
-        ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
-        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
-        ggml_format_name(r, "cache_r_l%d", i);
-        ggml_format_name(s, "cache_s_l%d", i);
-        r_l[i] = r;
-        s_l[i] = s;
 
-        // the PLE history needs its own row: Meta must mirror it while the delta-net conv state next door stays split
-        if (hparams.ple_conv_state() > 0 && hparams.is_ple(i)) {
-            ggml_tensor * p = ggml_new_tensor_2d(ctx, type_r, hparams.ple_conv_state(), n_rows);
-            ggml_format_name(p, "cache_ple_r_l%d", i);
-            p_l[i] = p;
+        if (in_filter) {
+            ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
+            ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
+            ggml_format_name(r, "cache_r_l%d", i);
+            ggml_format_name(s, "cache_s_l%d", i);
+            r_l[i] = r;
+            s_l[i] = s;
+
+            // the PLE history needs its own row: Meta must mirror it while the delta-net conv state next door stays split
+            if (hparams.ple_conv_state() > 0 && hparams.is_ple(i)) {
+                ggml_tensor * p = ggml_new_tensor_2d(ctx, type_r, hparams.ple_conv_state(), n_rows);
+                ggml_format_name(p, "cache_ple_r_l%d", i);
+                p_l[i] = p;
+            }
+        }
+
+        if (want_corr) {
+            ggml_tensor * c = ggml_new_tensor_2d(ctx, type_r, hparams.corr_conv_state(), n_rows);
+            ggml_format_name(c, "cache_corr_l%d", i);
+            c_l[i] = c;
         }
     }
 
@@ -129,12 +147,14 @@ llama_memory_recurrent::llama_memory_recurrent(
         const size_t memory_size_r = size_r_bytes();
         const size_t memory_size_s = size_s_bytes();
         const size_t memory_size_p = size_p_bytes();
+        const size_t memory_size_c = size_c_bytes();
 
-        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs %2u rs_seq), R (%s): %7.2f MiB, S (%s): %7.2f MiB, P (%s): %7.2f MiB\n", __func__,
-                (float)(memory_size_r + memory_size_s + memory_size_p) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq,
+        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs %2u rs_seq), R (%s): %7.2f MiB, S (%s): %7.2f MiB, P (%s): %7.2f MiB, C (%s): %7.2f MiB\n", __func__,
+                (float)(memory_size_r + memory_size_s + memory_size_p + memory_size_c) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq,
                 ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
                 ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f),
-                ggml_type_name(type_r), (float)memory_size_p / (1024.0f * 1024.0f));
+                ggml_type_name(type_r), (float)memory_size_p / (1024.0f * 1024.0f),
+                ggml_type_name(type_r), (float)memory_size_c / (1024.0f * 1024.0f));
     }
 }
 
@@ -763,6 +783,18 @@ size_t llama_memory_recurrent::size_p_bytes() const {
     return size_p_bytes;
 }
 
+size_t llama_memory_recurrent::size_c_bytes() const {
+    size_t size_c_bytes = 0;
+
+    for (const auto & c : c_l) {
+        if (c != nullptr) {
+            size_c_bytes += ggml_nbytes(c);
+        }
+    }
+
+    return size_c_bytes;
+}
+
 void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     GGML_UNUSED(flags);
 
@@ -932,6 +964,24 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
                 const size_t range_size = range.second - range.first;
                 io.write_tensor(p_l[il], range.first * p_size_row, range_size * p_size_row);
             }
+        }
+    }
+
+    // The qcorr corrector conv history gets its OWN top-level loop: unlike the PLE row it exists
+    // on layers where r_l[il] == nullptr (the full-attention layers), so nesting it inside the
+    // R loop above would silently drop most of it.
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (c_l[il] == nullptr) continue;
+
+        const int32_t c_type_i = (int32_t) c_l[il]->type;
+        io.write(&c_type_i, sizeof(c_type_i));
+
+        const uint64_t c_size_row = ggml_row_size(c_l[il]->type, hparams.corr_conv_state());
+        io.write(&c_size_row, sizeof(c_size_row));
+
+        for (const auto & range : cell_ranges) {
+            const size_t range_size = range.second - range.first;
+            io.write_tensor(c_l[il], range.first * c_size_row, range_size * c_size_row);
         }
     }
 
@@ -1147,6 +1197,31 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
         }
     }
 
+    // the qcorr corrector conv history, mirroring its own top-level loop in state_write_data
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (c_l[il] == nullptr) continue;
+
+        int32_t c_type_i_ref;
+        io.read(&c_type_i_ref, sizeof(c_type_i_ref));
+        const int32_t c_type_i = (int32_t) c_l[il]->type;
+        if (c_type_i != c_type_i_ref) {
+            LLAMA_LOG_ERROR("%s: mismatched corr type (%d != %d, layer %d)\n", __func__, c_type_i, c_type_i_ref, il);
+            return false;
+        }
+
+        uint64_t c_size_row_ref;
+        io.read(&c_size_row_ref, sizeof(c_size_row_ref));
+        const size_t c_size_row = ggml_row_size(c_l[il]->type, hparams.corr_conv_state());
+        if (c_size_row != c_size_row_ref) {
+            LLAMA_LOG_ERROR("%s: mismatched corr row size (%zu != %zu, layer %d)\n", __func__, c_size_row, (size_t) c_size_row_ref, il);
+            return false;
+        }
+
+        if (cell_count) {
+            io.read_tensor(c_l[il], head * c_size_row, cell_count * c_size_row);
+        }
+    }
+
     if (!s_trans) {
         for (uint32_t il = 0; il < n_layer; ++il) {
             // skip null layers
@@ -1301,6 +1376,10 @@ ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
 
 ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
     return mem->p_l[il];
+}
+
+ggml_tensor * llama_memory_recurrent_context::get_c_l(int32_t il) const {
+    return mem->c_l[il];
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {

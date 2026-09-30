@@ -2327,6 +2327,24 @@ struct llama_model_qwen35 : public llama_model_base {
                     ggml_tensor * input,
                             int   il);
 
+        // qcorr residual corrector: h -> h + gate * MLP(conv(norm(h))). Returns `h` unchanged
+        // for a layer without one, so the call site needs no guard.
+        ggml_tensor * build_corrector(
+             llm_graph_input_rs * inp,
+                    ggml_tensor * h,
+                            int   il);
+
+        // read the corrector's conv history out of its own recurrent row, left-concat it to x
+        // and write the new tail back. The shared build_conv_state cannot do this: it hard-codes
+        // hparams.n_embd_r() as the row width, and this row is corr_conv_state() wide.
+        ggml_tensor * build_corr_conv_state(
+             llm_graph_input_rs * inp,
+                    ggml_tensor * conv_states_all,
+                    ggml_tensor * x,
+                        int64_t   state_cols,
+                        int64_t   channels,
+                            int   il);
+
         const llama_model & model;
     };
 
