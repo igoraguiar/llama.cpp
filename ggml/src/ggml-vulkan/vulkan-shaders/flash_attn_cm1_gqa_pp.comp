@@ -143,7 +143,6 @@ void main() {
     }
 
     // Use -FLT_MAX/2 rather than -inf to reduce the possibility of NaNs, e.g. when computing Mold-M.
-    const float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFF);
 
     // this lane's query row: column lane % 16 of the pair's accumulators
     float Mq = NEG_FLT_MAX_OVER_2;

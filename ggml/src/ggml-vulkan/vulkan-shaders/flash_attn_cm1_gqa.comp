@@ -182,7 +182,6 @@ void main() {
     }
 
     // Use -FLT_MAX/2 rather than -inf to reduce the possibility of NaNs, e.g. when computing Mold-M.
-    const float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFF);
 
     // this thread's softmax row and first column
     const uint32_t sm_row = tid / TPR;

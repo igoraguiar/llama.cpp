@@ -1,9 +1,9 @@
 #pragma once
 
-#include <functional>
-
-#include "llama.h"
 #include "common.h"
+#include "llama.h"
+
+#include <functional>
 
 struct common_speculative;
 
@@ -45,8 +45,12 @@ struct common_speculative_output_limits {
 };
 
 // return the output limits needed for speculative decoding
-common_speculative_output_limits common_speculative_get_output_limits(
-        int32_t n_batch, int32_t n_parallel, int32_t n_draft);
+common_speculative_output_limits common_speculative_get_output_limits(int32_t n_batch,
+                                                                      int32_t n_parallel,
+                                                                      int32_t n_draft);
+
+// return true if the target and draft models have compatible vocabs
+bool common_speculative_are_compatible(const llama_model * model_tgt, const llama_model * model_dft);
 
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq);
 
@@ -74,11 +78,18 @@ struct common_speculative_draft_params {
 
     // rejection-sampling verification: sample each draft token from the draft distribution q
     // (softmax(logits / temp_q) over the draft sampler's candidates) instead of taking the argmax,
-    // and record q[i] for result[i]. only the MTP draft implements it; otherwise q stays empty
+    // and record q[i] for result[i]. implemented by the DFlash2 and MTP drafts; otherwise q stays empty
     bool  sample_q = false;
     float temp_q   = 1.0f;
-    float top_p_q  = 1.0f; // nucleus truncation of q before sampling (DFlash2 and MTP drafts; 1 = off)
+    float top_p_q  = 1.0f;  // nucleus truncation of q before sampling (DFlash2 and MTP drafts; 1 = off)
     std::vector<std::vector<llama_token_data>> q;
+
+    // candidate distribution per drafted token; set it to make draft-simple, draft-mtp and draft-dflash2 sample
+    std::vector<std::vector<llama_token_data>> * result_q = nullptr;
+
+    // the target's temp and seed, read only when the drafter samples probabilistically
+    float    temp = 1.0f;
+    uint32_t seed = LLAMA_DEFAULT_SEED;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -87,10 +98,15 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
 // process the batch and update the internal state of the speculative context
-bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
+bool common_speculative_process(common_speculative * spec, const common_batch & batch);
 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
+
+// same as common_speculative_draft, but calls on_submit once the draft model's first decode has been submitted
+// to the GPU (before waiting for it), so host work can overlap the draft; on_submit runs at the latest when
+// the draft returns
+void common_speculative_draft_overlap(common_speculative * spec, const std::function<void()> & on_submit);
 
 // same as common_speculative_draft, but calls on_submit once the draft model's first decode has been submitted
 // to the GPU (before waiting for it), so host work can overlap the draft; on_submit runs at the latest when
@@ -117,14 +133,16 @@ struct common_speculative_init_result {
     common_speculative_init_result(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
     ~common_speculative_init_result();
 
-    llama_model   * model();
+    llama_model *   model();
     llama_context * context();
 
-private:
+  private:
     struct impl;
     std::unique_ptr<impl> pimpl;
 };
 
 using common_speculative_init_result_ptr = std::unique_ptr<common_speculative_init_result>;
 
-common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
+common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params,
+                                                                       llama_model *   model_tgt,
+                                                                       llama_context * ctx_tgt);
