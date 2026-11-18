@@ -429,6 +429,10 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_MHC_SINKHORN,
+        GGML_OP_MHC_MERGE,
+        GGML_OP_MHC_ROUTE,
+
         GGML_OP_COUNT,
     };
 
@@ -2431,6 +2435,11 @@ extern "C" {
             struct ggml_tensor  * state,
             int64_t               K);
 
+    // Mark a GGML_OP_GATED_DELTA_NET node as in place: the kernel reads the initial state from
+    // `state` and writes the final state (K == 1) straight back into the same buffer, so no
+    // separate snapshot copy into the recurrent cache is needed.
+    GGML_API void ggml_gated_delta_net_set_inplace(struct ggml_tensor * t);
+
     // DSA lightning indexer
     //
     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
@@ -2459,6 +2468,58 @@ extern "C" {
     //                         + base[2*hc + dst + hc*src]
     // Softmax over dst, add eps, normalize over src, then repeat normalization
     // over dst followed by src for iterations 1 through n_iter - 1.
+    // mHC 2x2 Sinkhorn normalization (SenseNova-Loop routing), fused into one node.
+    //   logits [8, n_tok] is the router output; rows 4..7 hold the 2x2 mixture logits.
+    //   Runs n_iter row/column log-space normalizations and returns exp(mix_k) [4, n_tok],
+    //   which is bit-identical to the unfused 6-nodes-per-iteration graph chain.
+    //
+    GGML_API struct ggml_tensor * ggml_mhc_sinkhorn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            int32_t               n_iter);
+
+    // mHC fused residual merge (SenseNova-Loop routing), one node instead of 8.
+    //   a, b, branch [n_embd, n_tok] F32; post0, post1, mix0..mix3 [1, n_tok] (or [n_tok]) F32
+    //   out [n_embd, 2*n_tok] contiguous: rows [0, n_tok)  = a*mix0 + b*mix1 + branch*post0
+    //                                      rows [n_tok, 2*n_tok) = a*mix2 + b*mix3 + branch*post1
+    // The arithmetic per element follows the unfused graph chain
+    //   add(mul(a, mix0), mul(b, mix1)) then add(., mul(branch, post0)),
+    // same order, no reassociation (<= 1 ULP difference possible from FMA contraction).
+    //
+    GGML_API struct ggml_tensor * ggml_mhc_merge(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * branch,
+            struct ggml_tensor  * post0,
+            struct ggml_tensor  * post1,
+            struct ggml_tensor  * mix0,
+            struct ggml_tensor  * mix1,
+            struct ggml_tensor  * mix2,
+            struct ggml_tensor  * mix3);
+
+    // mHC fused routing chain (SenseNova-Loop), one node instead of ~14.
+    //   a, b [n_embd, n_tok] F32, weight [2*n_embd, 8] F32 (router rows), bias [8] F32.
+    //   Computes flat = rms_norm(concat(a, b), 1e-6), logits = weight*flat + bias,
+    //   then in one output tensor [n_embd + 6 (padded to a multiple of 4), n_tok] F32:
+    //     rows [0, n_embd)          = (a*sigmoid(logits[0]) + b*sigmoid(logits[1])) * pre_scale
+    //     row  n_embd               = 2*sigmoid(logits[2])
+    //     row  n_embd + 1           = 2*sigmoid(logits[3])
+    //     rows n_embd+2 .. n_embd+5 = exp(mix_k) after n_iter 2x2 Sinkhorn iterations
+    //   The Sinkhorn part is bit-identical to GGML_OP_MHC_SINKHORN; the GEMV reduction
+    //   order differs from the reference mul_mat path (<= 1 ULP, see mhc-route.cu).
+    //   The row count is padded to a multiple of 4 so nb[1] stays 16-byte aligned for the
+    //   vectorized downstream norm/matmul kernels; the pad rows are never read.
+    //
+    GGML_API struct ggml_tensor * ggml_mhc_route(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * weight,
+            struct ggml_tensor  * bias,
+            int32_t               n_iter,
+            float                 pre_scale);
+
     GGML_API struct ggml_tensor * ggml_dsv4_hc_comb(
             struct ggml_context * ctx,
             struct ggml_tensor  * mixes,

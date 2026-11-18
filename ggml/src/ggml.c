@@ -1112,9 +1112,13 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "MHC_SINKHORN",
+    "MHC_MERGE",
+    "MHC_ROUTE",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1225,9 +1229,13 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "mhc_sinkhorn(logits)",
+    "mhc_merge(a,b,branch)",
+    "mhc_route(a,b,w,b)",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6355,6 +6363,11 @@ struct ggml_tensor * ggml_gated_delta_net(
     return result;
 }
 
+void ggml_gated_delta_net_set_inplace(struct ggml_tensor * t) {
+    GGML_ASSERT(t->op == GGML_OP_GATED_DELTA_NET);
+    ggml_set_op_params_i32(t, 1, 1);
+}
+
 // ggml_lightning_indexer
 
 struct ggml_tensor * ggml_lightning_indexer(
@@ -6387,6 +6400,128 @@ struct ggml_tensor * ggml_lightning_indexer(
     result->src[1] = k;
     result->src[2] = weights;
     result->src[3] = mask;
+
+    return result;
+}
+
+// ggml_mhc_sinkhorn
+
+struct ggml_tensor * ggml_mhc_sinkhorn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * logits,
+        int32_t               n_iter) {
+    GGML_ASSERT(logits->type == GGML_TYPE_F32);
+    GGML_ASSERT(logits->ne[0] == 8);
+    GGML_ASSERT(logits->ne[2] == 1);
+    GGML_ASSERT(logits->ne[3] == 1);
+    GGML_ASSERT(n_iter > 0);
+
+    const int64_t n_tokens = logits->ne[1];
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, n_tokens);
+
+    ggml_set_op_params_i32(result, 0, n_iter);
+
+    result->op     = GGML_OP_MHC_SINKHORN;
+    result->src[0] = logits;
+
+    return result;
+}
+
+// ggml_mhc_merge
+
+struct ggml_tensor * ggml_mhc_merge(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * branch,
+        struct ggml_tensor  * post0,
+        struct ggml_tensor  * post1,
+        struct ggml_tensor  * mix0,
+        struct ggml_tensor  * mix1,
+        struct ggml_tensor  * mix2,
+        struct ggml_tensor  * mix3) {
+    GGML_ASSERT(a->type      == GGML_TYPE_F32);
+    GGML_ASSERT(b->type      == GGML_TYPE_F32);
+    GGML_ASSERT(branch->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->ne[0] == b->ne[0] && a->ne[0] == branch->ne[0]);
+    GGML_ASSERT(a->ne[1] == b->ne[1] && a->ne[1] == branch->ne[1]);
+    GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1);
+    GGML_ASSERT(a->nb[0] == ggml_element_size(a));
+    GGML_ASSERT(b->nb[0] == ggml_element_size(b));
+    GGML_ASSERT(branch->nb[0] == ggml_element_size(branch));
+
+    const int64_t n_embd = a->ne[0];
+    const int64_t n_tok  = a->ne[1];
+
+    {
+        const struct ggml_tensor * hs[6] = { post0, post1, mix0, mix1, mix2, mix3 };
+        for (int i = 0; i < 6; ++i) {
+            const struct ggml_tensor * h = hs[i];
+            GGML_ASSERT(h != NULL && h->type == GGML_TYPE_F32);
+            GGML_ASSERT(h->ne[0] == 1 && h->ne[1] == n_tok);
+            GGML_ASSERT(h->ne[2] == 1 && h->ne[3] == 1);
+            GGML_ASSERT(h->nb[0] == ggml_element_size(h));
+        }
+    }
+
+    // Two contiguous row blocks in one tensor: [a', b'] of shape [n_embd, 2*n_tok].
+    // Downstream views are contiguous, so no extra copy is introduced.
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 2*n_tok);
+
+    result->op     = GGML_OP_MHC_MERGE;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = branch;
+    result->src[3] = post0;
+    result->src[4] = post1;
+    result->src[5] = mix0;
+    result->src[6] = mix1;
+    result->src[7] = mix2;
+    result->src[8] = mix3;
+
+    return result;
+}
+
+// ggml_mhc_route
+
+struct ggml_tensor * ggml_mhc_route(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * weight,
+        struct ggml_tensor  * bias,
+        int32_t               n_iter,
+        float                 pre_scale) {
+    GGML_ASSERT(a->type      == GGML_TYPE_F32);
+    GGML_ASSERT(b->type      == GGML_TYPE_F32);
+    GGML_ASSERT(weight->type == GGML_TYPE_F32);
+    GGML_ASSERT(bias->type   == GGML_TYPE_F32);
+    GGML_ASSERT(a->ne[0] == b->ne[0] && a->ne[1] == b->ne[1]);
+    GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1);
+    GGML_ASSERT(a->nb[0] == ggml_element_size(a));
+    GGML_ASSERT(b->nb[0] == ggml_element_size(b));
+    GGML_ASSERT(weight->ne[0] == 2*a->ne[0] && weight->ne[1] == 8);
+    GGML_ASSERT(weight->nb[0] == ggml_element_size(weight));
+    GGML_ASSERT(bias->ne[0] == 8 && bias->ne[1] == 1 && bias->ne[2] == 1 && bias->ne[3] == 1);
+    GGML_ASSERT(n_iter > 0);
+
+    const int64_t n_embd = a->ne[0];
+    const int64_t n_tok  = a->ne[1];
+    // n_embd input rows + 6 routing rows, padded to a multiple of 4 so that nb[1] is a
+    // multiple of 16 bytes (keeps the downstream vectorized kernels on their float4 paths).
+    const int64_t n_row  = (n_embd + 6 + 3) & ~(int64_t) 3;
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_row, n_tok);
+
+    ggml_set_op_params_i32(result, 0, n_iter);
+    ggml_set_op_params_f32(result, 1, pre_scale);
+
+    result->op     = GGML_OP_MHC_ROUTE;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = weight;
+    result->src[3] = bias;
 
     return result;
 }

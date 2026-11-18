@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include <cstring>
+
 #include "llama-impl.h"
 #include "llama-memory-recurrent.h"
 
@@ -76,6 +78,81 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     return conv_input;
 }
 
+// The in-place GATED_DELTA_NET writes into src[5]; the scheduler does not know about that
+// write. If the node runs on another backend than the one owning the state buffer, the
+// scheduler hands the kernel a temporary copy and the new state is silently lost. So the
+// in-place path is only safe when the node is certain to run where the state lives:
+//  * state in a CUDA/HIP device buffer: the layer is offloaded, its nodes run on that device
+//    and that backend implements the in-place flag (other GPU backends ignore op param 1)
+//  * state in a host buffer and op offloading disabled: the node stays on the CPU backend
+// Measured without this check (RX 6900 XT, -ngl 20): mean KLD 0.32 vs 0.0013.
+static bool gdn_state_buffer_inplace_safe(const ggml_tensor * states_all, bool op_offload) {
+    const ggml_tensor * base = states_all->view_src ? states_all->view_src : states_all;
+    ggml_backend_buffer_t buf = base->buffer;
+    if (buf == nullptr) {
+        return false;
+    }
+    if (ggml_backend_buffer_is_host(buf)) {
+        return !op_offload;
+    }
+    const char * name = ggml_backend_buft_name(ggml_backend_buffer_get_type(buf));
+    return name != nullptr && (strncmp(name, "CUDA", 4) == 0 || strncmp(name, "ROCm", 4) == 0);
+}
+
+bool llm_build_delta_net_base::gdn_state_can_inplace(const llm_graph_input_rs * inp, const ggml_tensor * ssm_states_all, int64_t n_seqs) const {
+    // LLAMA_GDN_INPLACE=0 restores the GET_ROWS + CPY state round trip (A/B reference)
+    static const bool enabled = []() {
+        const char * e = getenv("LLAMA_GDN_INPLACE");
+        return !(e && atoi(e) == 0);
+    }();
+    if (!enabled || n_seqs != 1) {
+        return false;
+    }
+    const auto * mctx_cur = inp->mctx;
+    if (mctx_cur == nullptr) {
+        return false;
+    }
+    if (cparams.n_rs_seq > 0) {
+        return false; // rollback snapshots use the keep path
+    }
+    if (mctx_cur->get_n_rs() != 1) {
+        return false; // exactly one gathered state row
+    }
+    if (mctx_cur->get_rs_z() >= 0) {
+        return false; // a zeroed state slot is still in use
+    }
+    if (!gdn_state_buffer_inplace_safe(ssm_states_all, cparams.op_offload)) {
+        return false; // the node may run on a backend that does not own the state buffer
+    }
+    // the row that build_rs() would gather must be the slot the delta-net writes back to.
+    // s_copy() is side-effect free here because n_rs_seq == 0 (it returns cells[head].src0).
+    return mctx_cur->s_copy(0) == (int32_t) mctx_cur->get_head();
+}
+
+ggml_tensor * llm_build_delta_net_base::build_gdn_state(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        ssm_states_all,
+        int64_t              S_v,
+        int64_t              H_v,
+        int64_t              n_seqs,
+        int                  il) {
+    if (gdn_state_can_inplace(inp, ssm_states_all, n_seqs)) {
+        const uint32_t head = inp->mctx->get_head();
+        // the graph now depends on s_copy(0) == head, see llm_graph_input_rs::can_reuse_inplace()
+        inp->gdn_inplace = true;
+        GGML_ASSERT(hparams.n_embd_s() == S_v * S_v * H_v);
+        ggml_tensor * state = ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), 1, ssm_states_all->nb[1],
+                (size_t) head * hparams.n_embd_s() * ggml_element_size(ssm_states_all));
+        state = ggml_reshape_4d(ctx0, state, S_v, S_v, H_v, 1);
+        cb(state, "state_predelta_inplace", il);
+        return state;
+    }
+    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    state = ggml_reshape_4d(ctx0, state, S_v, S_v, H_v, n_seqs);
+    cb(state, "state_predelta", il);
+    return state;
+}
+
 ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         llm_graph_input_rs * inp,
         ggml_tensor *        ssm_states_all,
@@ -85,7 +162,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_tensor *        g,
         ggml_tensor *        b,
         ggml_tensor *        s,
-        int                  il) {
+        int                  il,
+        bool                 inplace_state) {
     const auto * mctx_cur   = inp->mctx;
     const auto   kv_head    = mctx_cur->get_head();
     const uint32_t mem_size = mctx_cur->get_size();
@@ -98,6 +176,19 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const bool keep = cparams.n_rs_seq > 0;
 
     if (!keep) {
+        if (inplace_state) {
+            // s already is the cache slot: the kernel reads and writes it in place, no GET_ROWS/CPY
+            GGML_ASSERT(s->ne[3] == 1);
+            ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1);
+            ggml_gated_delta_net_set_inplace(result);
+            ggml_tensor * output = ggml_view_4d(ctx0, result,
+                    S_v, H_v, n_tokens, n_seqs,
+                    ggml_row_size(result->type, S_v),
+                    ggml_row_size(result->type, S_v * H_v),
+                    ggml_row_size(result->type, S_v * H_v * n_tokens), 0);
+            cb(output, "attn_output", il);
+            return output;
+        }
         auto attn_out = build_delta_net(q, k, v, g, b, s);
         ggml_tensor * output    = attn_out.first;
         ggml_tensor * new_state = attn_out.second;

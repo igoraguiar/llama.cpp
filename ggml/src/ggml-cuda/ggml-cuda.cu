@@ -65,6 +65,9 @@
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
+#include "ggml-cuda/mhc-sinkhorn.cuh"
+#include "ggml-cuda/mhc-merge.cuh"
+#include "ggml-cuda/mhc-route.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
@@ -3116,7 +3119,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_gated_linear_attn(ctx, dst);
             break;
         case GGML_OP_GATED_DELTA_NET:
-            ggml_cuda_op_gated_delta_net(ctx, dst);
+            if (ggml_get_op_params_i32(dst, 1) != 0) {
+                // in place: the initial state is the recurrent cache slot, write the final state back into it
+                ggml_cuda_gated_delta_net_fused_cache cache;
+                cache.data        = (float *) dst->src[5]->data;
+                cache.slot_stride = 0;
+                ggml_cuda_op_gated_delta_net_fused_cache(ctx, dst, cache);
+            } else {
+                ggml_cuda_op_gated_delta_net(ctx, dst);
+            }
             break;
         case GGML_OP_DSV4_HC_COMB:
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
@@ -3126,6 +3137,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_DSV4_HC_POST:
             ggml_cuda_op_dsv4_hc_post(ctx, dst);
+            break;
+        case GGML_OP_MHC_SINKHORN:
+            ggml_cuda_op_mhc_sinkhorn(ctx, dst);
+            break;
+        case GGML_OP_MHC_MERGE:
+            ggml_cuda_op_mhc_merge(ctx, dst);
+            break;
+        case GGML_OP_MHC_ROUTE:
+            ggml_cuda_op_mhc_route(ctx, dst);
             break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
@@ -6791,6 +6811,31 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                 op->type == GGML_TYPE_F32;
+        case GGML_OP_MHC_SINKHORN:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] == 8 &&
+                op->type == GGML_TYPE_F32 && op->ne[0] == 4;
+        case GGML_OP_MHC_MERGE:
+            for (int i = 0; i < 9; ++i) {
+                if (op->src[i] == nullptr || op->src[i]->type != GGML_TYPE_F32) {
+                    return false;
+                }
+            }
+            return op->type == GGML_TYPE_F32 && op->src[0]->ne[0] == op->ne[0] &&
+                op->ne[1] == 2*op->src[0]->ne[1] && op->src[0]->nb[0] == sizeof(float) &&
+                op->src[1]->nb[0] == sizeof(float) && op->src[2]->nb[0] == sizeof(float);
+        case GGML_OP_MHC_ROUTE:
+            if (op->src[0] == nullptr || op->src[1] == nullptr ||
+                op->src[2] == nullptr || op->src[3] == nullptr) {
+                return false;
+            }
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_F32 &&
+                op->src[0]->nb[0] == sizeof(float) && op->src[1]->nb[0] == sizeof(float) &&
+                op->src[2]->nb[0] == sizeof(float) &&
+                op->src[2]->ne[0] == 2*op->src[0]->ne[0] && op->src[2]->ne[1] == 8 &&
+                op->src[3]->ne[0] == 8 && op->ne[1] == op->src[0]->ne[1] &&
+                op->ne[0] >= op->src[0]->ne[0] + 6;
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:

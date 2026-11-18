@@ -1,5 +1,96 @@
 # llama.cpp
 
+## SenseNova-Loop on AMD RDNA2 (ROCm/HIP): fused mHC ops
+
+This fork of [OpenSenseNova/llama.cpp](https://github.com/OpenSenseNova/llama.cpp) (base commit `24ea7bb`)
+speeds up token generation of `sensenova_loop` models on the HIP backend. The weights are not touched: the
+same GGUF file is used, only the compute graph and the kernels change.
+
+Measured on an RX 6900 XT (gfx1030, ROCm 10.1) with `SenseNova-Loop-9B-Q4_K_M.gguf`, `-ngl 99 -fa on`:
+
+| | tg128 | pp128 |
+|---|---|---|
+| base `24ea7bb` | 6.0 t/s | 556 t/s |
+| this fork | 40.5 t/s | 758 t/s |
+
+One decoded token costs 22.3 ms of kernel time, 83 % of it in the quantized GEMV (`mul_mat_vec_q`), which
+reads 8.2 GB of weights per token at 443 GB/s, i.e. 87 % of the card's theoretical memory bandwidth.
+
+### What changed
+
+| Change | Switch (default) | Numerics |
+|---|---|---|
+| 2x2 Sinkhorn loop as one op `GGML_OP_MHC_SINKHORN` | `LLAMA_MHC_SINKHORN_LEGACY=0` | bit-identical |
+| Routing chain as one op `GGML_OP_MHC_ROUTE` | `LLAMA_MHC_ROUTE_FUSED=1` | rounding only |
+| One-softplus Sinkhorn normalize inside the route kernel | `LLAMA_MHC_ROUTE_EXACT=0` | rounding only |
+| Residual merge as one op `GGML_OP_MHC_MERGE` | `LLAMA_MHC_MERGE_FUSED=1` | rounding only |
+| Router `MUL_MAT` no longer requests `GGML_PREC_F32` for src1 (HIP rejected it and ran 96 GEMVs per token on the CPU) | always | none |
+| Gated-delta-net state read and written in place in the recurrent cache | `LLAMA_GDN_INPLACE=1` | bit-identical |
+| Zero-sized recurrent-state nodes skipped | `LLAMA_RS_SKIP_ZERO=1` | bit-identical |
+
+Further switches: `LLAMA_MHC_ROUTE_GENERIC=1` (scalar route kernel), `LLAMA_MHC_SINKHORN_NOFUSED=1`
+(soft_max/log graph chain), `LLAMA_MHC_ITER_CLAMP=N` (fewer Sinkhorn iterations, diagnostics only).
+
+The in-place state path is only taken when the state buffer lives on the CUDA/HIP device that runs the
+layer (or on the host with `--no-op-offload`), for a single sequence without rollback snapshots. Everything
+else uses the original gather/copy path.
+
+### Measured KL divergence
+
+`llama-perplexity --kl-divergence`, 16 chunks of 512 tokens (`-b 512 -ub 64`), compared against the
+unfused reference graph of the same build (`LLAMA_MHC_ROUTE_FUSED=0 LLAMA_MHC_MERGE_FUSED=0
+LLAMA_MHC_SINKHORN_LEGACY=1 LLAMA_GDN_INPLACE=0 LLAMA_RS_SKIP_ZERO=0`, PPL 7.073 ± 0.302).
+
+| Variant | Mean KLD | Max KLD | Same top token | PPL |
+|---|---|---|---|---|
+| reference, second run | 0.000000 | 0.00006 | 100.00 % | 7.078 |
+| fused Sinkhorn op only | 0.000000 | 0.00006 | 100.00 % | 7.078 |
+| reference with `-fa off` (noise floor of the model) | 0.001405 | 0.346 | 98.36 % | 7.071 |
+| fused merge only | 0.001085 | 0.120 | 98.58 % | 7.070 |
+| **all optimizations (default)** | **0.001153** | **0.069** | **98.28 %** | **7.063** |
+| default, `LLAMA_GDN_INPLACE=0` | 0.001153 | 0.069 | 98.28 % | 7.063 |
+| default, `LLAMA_MHC_ROUTE_EXACT=1` | 0.001238 | 0.181 | 98.60 % | 7.066 |
+| default, `LLAMA_MHC_ROUTE_GENERIC=1` | 0.001152 | 0.062 | 98.28 % | 7.075 |
+| default, two sequences per batch (`-b 1024`) | 0.001177 | – | 98.63 % | 7.075 |
+| default, `-ctk q8_0 -ctv q8_0` | 0.001279 | 0.043 | 98.36 % | 7.070 |
+| default, `-ngl 20` (partial offload) | 0.001302 | – | 98.36 % | – |
+| default, `-ngl 0` | 0.001256 | – | 98.31 % | 7.077 |
+| CPU only (`-ngl 0 --no-op-offload`), default | 0.012536 | – | 95.66 % | – |
+| CPU only, unfused reference graph | 0.012985 | – | 95.54 % | – |
+| `LLAMA_MHC_SINKHORN_NOFUSED=1` (with `LLAMA_MHC_ROUTE_FUSED=0`) | 0.040057 | – | 92.43 % | 7.079 |
+| `LLAMA_MHC_ITER_CLAMP=10` | 0.070800 | 6.655 | 90.59 % | 7.619 |
+| `LLAMA_MHC_ITER_CLAMP=5` | 0.517135 | 11.202 | 74.14 % | 10.686 |
+
+How to read this:
+
+- The default configuration differs from the reference by the same amount as the reference differs from
+  itself with another attention kernel (`-fa off`). The model amplifies rounding differences strongly, so
+  any change of kernel or summation order lands at a mean KLD of about 0.001; perplexity does not move.
+- CPU and GPU differ by about 0.013 in the unmodified graph already; the fused ops add nothing to that.
+- `LLAMA_MHC_SINKHORN_NOFUSED` and `LLAMA_MHC_ITER_CLAMP` do lose accuracy and are kept for diagnostics only.
+
+### Build (ROCm 10.1, gfx1030)
+
+```bash
+ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm cmake -B build-rocm -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1030 -DCMAKE_HIP_ARCHITECTURES=gfx1030 \
+  -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=ON \
+  -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_APP=OFF -DHIP_ROOT=/opt/rocm \
+  -DCMAKE_HIP_COMPILER=/opt/rocm/bin/amdclang++ \
+  -DCMAKE_HIP_FLAGS="-isystem /opt/rocm/include -L/opt/rocm/lib" -DCMAKE_BUILD_RPATH=/opt/rocm/lib
+cmake --build build-rocm -j --target llama-bench llama-server llama-cli llama-perplexity
+```
+
+### Limits
+
+- Only the CUDA/HIP backend and the CPU backend implement the new ops. Other GPU backends fall back to
+  the CPU for them.
+- The route kernel assumes 32-lane wavefronts (RDNA); it is untested on gfx8/gfx9.
+- Tested on one card and one model file only.
+
+---
+
+
 ![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">

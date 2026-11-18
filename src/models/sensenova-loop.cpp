@@ -1,6 +1,7 @@
 #include "models.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 
 void llama_model_sensenova_loop::load_arch_hparams(llama_model_loader & ml) {
@@ -104,12 +105,50 @@ std::unique_ptr<llm_graph_context> llama_model_sensenova_loop::build_arch_graph(
 
 llama_model_sensenova_loop::graph::routing llama_model_sensenova_loop::graph::build_route(
         ggml_tensor * a, ggml_tensor * b, ggml_tensor * weight, ggml_tensor * bias, int il) {
+    // FUSED PATH: one GGML_OP_MHC_ROUTE node replaces the ~14-node reference chain
+    // (concat + rms_norm + mul_mat + add(bias) + two stream sigmoid/mul/add + scale +
+    // two post sigmoid/scale + the fused Sinkhorn node). With 96 routings per decoded
+    // token that removes ~1300 graph nodes. LLAMA_MHC_ROUTE_FUSED=0 restores the
+    // reference chain below (A/B reference, kept fully intact).
+    static const bool route_fused = [] {
+        const char * e = getenv("LLAMA_MHC_ROUTE_FUSED");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (route_fused && !hparams.mhc_fixed_identity) {
+        // same diagnostic clamp as the reference path (LLAMA_MHC_ITER_CLAMP)
+        static const uint32_t route_max_iter = []() -> uint32_t {
+            const char * e = getenv("LLAMA_MHC_ITER_CLAMP");
+            if (e == nullptr) return UINT32_MAX;
+            const long v = atol(e);
+            return v > 0 ? (uint32_t) v : UINT32_MAX;
+        }();
+        const uint32_t n_iter = std::min<uint32_t>(hparams.mhc_iterations, route_max_iter);
+        ggml_tensor * fused = ggml_mhc_route(ctx0, a, b, weight, bias, (int32_t) n_iter, hparams.mhc_pre_scale);
+        const int64_t n_embd = a->ne[0];
+        const int64_t n_tok  = a->ne[1];
+        routing result{};
+        result.input   = ggml_view_2d(ctx0, fused, n_embd, n_tok, fused->nb[1], 0);
+        result.post[0] = ggml_view_2d(ctx0, fused, 1, n_tok, fused->nb[1], (n_embd + 0)*fused->nb[0]);
+        result.post[1] = ggml_view_2d(ctx0, fused, 1, n_tok, fused->nb[1], (n_embd + 1)*fused->nb[0]);
+        for (int i = 0; i < 4; ++i) {
+            result.mix[i] = ggml_view_2d(ctx0, fused, 1, n_tok, fused->nb[1], (n_embd + 2 + i)*fused->nb[0]);
+        }
+        cb(result.input, "mhc_input", il);
+        return result;
+    }
     ggml_tensor * flat = ggml_concat(ctx0, a, b, 0);
     flat = ggml_rms_norm(ctx0, flat, 1e-6f);
     ggml_tensor * logits = build_lora_mm(weight, flat);
     if (logits->op == GGML_OP_MUL_MAT) {
         ggml_prec_set_acc(logits, GGML_PREC_F32);
-        ggml_prec_set_src(logits, GGML_PREC_F32, 1);
+        // NOTE: do NOT request GGML_PREC_F32 for src[1] here. The HIP backend rejects
+        // MUL_MAT with prec_src1 == F32 on non-NVIDIA devices (ggml-cuda.cu:
+        // f32_src1_ok = CC_IS_NVIDIA(cc) && cc < AMPERE), while the buft probe in
+        // weight_buft_supported() builds a plain F32 mul_mat without that flag and
+        // therefore reports the ROCm buffer type as supported. The mismatch left the
+        // weights in ROCm buffers but ran the op on the CPU (96 device->host->device
+        // round trips per token). The router weights are F32, so no tensor-core
+        // downcast of src1 is possible either way; HIP uses the FP32 mul_mat path.
     }
     logits = ggml_add(ctx0, logits, bias);
     auto row = [&](int i) {
@@ -122,23 +161,100 @@ llama_model_sensenova_loop::graph::routing llama_model_sensenova_loop::graph::bu
     result.post[0] = ggml_scale(ctx0, ggml_sigmoid(ctx0, row(2)), 2.0f);
     result.post[1] = ggml_scale(ctx0, ggml_sigmoid(ctx0, row(3)), 2.0f);
     if (!hparams.mhc_fixed_identity) {
-        for (int i = 0; i < 4; ++i) {
-            result.mix[i] = row(4 + i);
-        }
-        auto normalize = [&](ggml_tensor * & x, ggml_tensor * & y) {
-            // Two-element log-softmax, without exponentiating the unnormalized logits.
-            ggml_tensor * delta = ggml_sub(ctx0, x, y);
-            x = ggml_neg(ctx0, ggml_softplus(ctx0, ggml_neg(ctx0, delta)));
-            y = ggml_neg(ctx0, ggml_softplus(ctx0, delta));
-        };
-        for (uint32_t i = 0; i < hparams.mhc_iterations; ++i) {
-            normalize(result.mix[0], result.mix[1]);
-            normalize(result.mix[2], result.mix[3]);
-            normalize(result.mix[0], result.mix[2]);
-            normalize(result.mix[1], result.mix[3]);
-        }
-        for (auto & mix : result.mix) {
-            mix = ggml_exp(ctx0, mix);
+        // 2x2 Sinkhorn (row/col log-normalization of the routing matrix).
+        //
+        // Default path below: the entire loop is a single fused ggml node
+        // (GGML_OP_MHC_SINKHORN, one node per routing). LLAMA_MHC_SINKHORN_LEGACY=1
+        // restores the original scalar node loop (reference for A/B), and
+        // LLAMA_MHC_SINKHORN_NOFUSED=1 the vectorized graph chain.
+        //
+        // The reference implementation unrolls each pairwise normalize() into
+        // sub/neg/softplus/neg scalar nodes: 24 graph nodes per iteration, two routes
+        // per mHC layer execution -> ~46k tiny kernel launches per decoded token at
+        // mhc_iterations=20, which makes token generation pure launch overhead on GPU
+        // backends (measured ~6 t/s on a RX 6900 XT, GPU 96-98% busy doing nothing).
+        //
+        // A two-element normalize(x, y) = [x, y] - lse(x, y) is exactly
+        // log(soft_max([x, y])), so a full row+col iteration over the 2x2 matrix
+        // M[r][c] = mix[2r + c] becomes:
+        //   row norm: X = log(soft_max(X)) on the [c, t, r] layout (softmax over ne[0])
+        //   col norm: same on the transposed [r, t, c] layout
+        // i.e. 6 nodes per iteration (soft_max, log, cont each) instead of 24, with
+        // identical results in exact arithmetic (log-softmax identity).
+        // LLAMA_MHC_SINKHORN_LEGACY=1 restores the original scalar node loop.
+        static const bool legacy = [] {
+            const char * e = getenv("LLAMA_MHC_SINKHORN_LEGACY");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        if (legacy) {
+            for (int i = 0; i < 4; ++i) {
+                result.mix[i] = row(4 + i);
+            }
+            auto normalize = [&](ggml_tensor * & x, ggml_tensor * & y) {
+                // Two-element log-softmax, without exponentiating the unnormalized logits.
+                ggml_tensor * delta = ggml_sub(ctx0, x, y);
+                x = ggml_neg(ctx0, ggml_softplus(ctx0, ggml_neg(ctx0, delta)));
+                y = ggml_neg(ctx0, ggml_softplus(ctx0, delta));
+            };
+            for (uint32_t i = 0; i < hparams.mhc_iterations; ++i) {
+                normalize(result.mix[0], result.mix[1]);
+                normalize(result.mix[2], result.mix[3]);
+                normalize(result.mix[0], result.mix[2]);
+                normalize(result.mix[1], result.mix[3]);
+            }
+            for (auto & mix : result.mix) {
+                mix = ggml_exp(ctx0, mix);
+            }
+        } else {
+            const int64_t n_tok = a->ne[1];
+            // DIAGNOSTIC/OPTIMIZATION: allow clamping the Sinkhorn iteration count.
+            // The model was trained with hparams.mhc_iterations (20); values below that
+            // change the numerics slightly and are only for A/B measurements.
+            static const uint32_t sinkhorn_max_iter = []() -> uint32_t {
+                const char * e = getenv("LLAMA_MHC_ITER_CLAMP");
+                if (e == nullptr) return UINT32_MAX;
+                const long v = atol(e);
+                return v > 0 ? (uint32_t) v : UINT32_MAX;
+            }();
+            const uint32_t n_sinkhorn_iter = std::min<uint32_t>(hparams.mhc_iterations, sinkhorn_max_iter);
+            // FUSED OP: the whole Sinkhorn loop runs inside one ggml node
+            // (GGML_OP_MHC_SINKHORN) instead of 6 nodes per iteration, which removes
+            // ~11.5k kernel launches per decoded token. LLAMA_MHC_SINKHORN_NOFUSED=1
+            // falls back to the vectorized log-softmax chain below.
+            static const bool no_fused = [] {
+                const char * e = getenv("LLAMA_MHC_SINKHORN_NOFUSED");
+                return e != nullptr && atoi(e) != 0;
+            }();
+            if (no_fused) {
+                // X[c, t, r] = logits[4 + 2*r + c, t] (strided view of the mix rows, then a
+                // contiguous copy: the CUDA/HIP soft_max kernel assumes flat contiguous rows)
+                ggml_tensor * X = ggml_cont(ctx0, ggml_view_3d(ctx0, logits, 2, n_tok, 2,
+                                                                logits->nb[1], 2*logits->nb[0], 4*logits->nb[0]));
+                for (uint32_t it = 0; it < n_sinkhorn_iter; ++it) {
+                    // row normalization: pairs (mix[0], mix[1]) and (mix[2], mix[3]) along ne[0]
+                    X = ggml_log(ctx0, ggml_soft_max(ctx0, X));
+                    // transpose dims 0<->2 for the column normalization
+                    X = ggml_cont(ctx0, ggml_permute(ctx0, X, 2, 1, 0, 3));
+                    // col normalization: pairs (mix[0], mix[2]) and (mix[1], mix[3]) along ne[0]
+                    X = ggml_log(ctx0, ggml_soft_max(ctx0, X));
+                    if (it + 1 < n_sinkhorn_iter) {
+                        X = ggml_cont(ctx0, ggml_permute(ctx0, X, 2, 1, 0, 3));
+                    }
+                }
+                X = ggml_exp(ctx0, X); // back to mixture weights; X is [r, t, c] contiguous
+                for (int r = 0; r < 2; ++r) {
+                    for (int c = 0; c < 2; ++c) {
+                        result.mix[2*r + c] = ggml_view_2d(ctx0, X, 1, n_tok, X->nb[1],
+                                                           r*X->nb[2] + c*X->nb[0]);
+                    }
+                }
+            } else {
+                ggml_tensor * sink = ggml_mhc_sinkhorn(ctx0, logits, (int32_t) n_sinkhorn_iter);
+                for (int i = 0; i < 4; ++i) {
+                    // exp(mix_i) as a [1, n_tok] row view, same layout as the logits rows
+                    result.mix[i] = ggml_view_2d(ctx0, sink, 1, n_tok, sink->nb[1], i*sink->nb[0]);
+                }
+            }
         }
     }
     cb(result.input, "mhc_input", il);
@@ -147,6 +263,25 @@ llama_model_sensenova_loop::graph::routing llama_model_sensenova_loop::graph::bu
 
 void llama_model_sensenova_loop::graph::build_merge(
         ggml_tensor * & a, ggml_tensor * & b, ggml_tensor * branch, const routing & route) {
+    // FUSED PATH: one ggml node (GGML_OP_MHC_MERGE) replaces the ten elementwise nodes
+    // of the reference chain below (6 mul + 4 add: 2x2 mixture + two branch injections).
+    // Two merges run per mHC layer execution (attn + ffn), so this removes 18 graph nodes
+    // per layer execution at n_tok=1 (measured: 4233 -> 3369 nodes per decode graph).
+    // LLAMA_MHC_MERGE_FUSED=0 restores the reference chain (A/B reference path).
+    static const bool merge_fused = [] {
+        const char * e = getenv("LLAMA_MHC_MERGE_FUSED");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (merge_fused && !hparams.mhc_fixed_identity) {
+        const int64_t n_tok = a->ne[1];
+        ggml_tensor * merged = ggml_mhc_merge(ctx0, a, b, branch,
+                route.post[0], route.post[1],
+                route.mix[0], route.mix[1], route.mix[2], route.mix[3]);
+        // Two contiguous row blocks: a' = [0, n_tok), b' = [n_tok, 2*n_tok).
+        a = ggml_view_2d(ctx0, merged, merged->ne[0], n_tok, merged->nb[1], 0);
+        b = ggml_view_2d(ctx0, merged, merged->ne[0], n_tok, merged->nb[1], n_tok*merged->nb[1]);
+        return;
+    }
     ggml_tensor * next_a = a;
     ggml_tensor * next_b = b;
     if (!hparams.mhc_fixed_identity) {

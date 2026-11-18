@@ -11144,7 +11144,10 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     const int64_t attn_score_elems    = S_v * H * n_tokens * n_seqs;
     const int64_t state_size_per_snap = S_v * S_v * H * n_seqs;
     float * attn_out_base  = (float *)dst->data;
-    float * state_out_base = (float *)dst->data + attn_score_elems;
+    // op param 1: in place, i.e. the initial state buffer is also the state output buffer
+    float * state_out_base = ggml_get_op_params_i32(dst, 1) != 0
+        ? (float *) src_state->data
+        : (float *) dst->data + attn_score_elems;
 
     // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
     // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
@@ -11177,7 +11180,9 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         // copy input state into the working buffer and operate in-place
         // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
         const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
-        memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        if (s_out != s_in) { // in place: the state is already where it is updated
+            memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        }
 
         // attn output pointer for first token of this (head, seq)
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
@@ -12482,5 +12487,275 @@ void ggml_compute_forward_lightning_indexer(
                 dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
             }
         }
+    }
+}
+
+// ggml_compute_forward_mhc_sinkhorn
+//
+// Fused 2x2 log-space Sinkhorn normalization of the mHC routing matrix (SenseNova-Loop).
+// The reference graph applies the pairwise normalize() below 4x per iteration over 2x2
+// logits, which costs 6 graph nodes per iteration; here the whole loop runs on four
+// registers of one thread per token. The arithmetic is kept identical (same softplus
+// expression as ggml-cpu/unary-ops.cpp) so the result is bit-identical.
+
+static inline float ggml_mhc_softplus(float x) {
+    return (x > 20.0f) ? x : log1pf(expf(x));
+}
+
+// normalize(x, y) = log(soft_max([x, y])) == -(softplus(-d), softplus(d)) with d = x - y
+static inline void ggml_mhc_normalize(float & x, float & y) {
+    const float d = x - y;
+    x = -ggml_mhc_softplus(-d);
+    y = -ggml_mhc_softplus( d);
+}
+
+static void ggml_compute_forward_mhc_sinkhorn_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * logits = dst->src[0];
+
+    GGML_ASSERT(logits->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type    == GGML_TYPE_F32);
+    GGML_ASSERT(logits->ne[0] == 8);
+    GGML_ASSERT(dst->ne[0] == 4);
+    GGML_ASSERT(dst->ne[1] == logits->ne[1]);
+
+    GGML_TENSOR_LOCALS(size_t, nbs, logits, nb);
+    GGML_TENSOR_LOCALS(size_t, nbd, dst,    nb);
+
+    const int32_t n_iter = ggml_get_op_params_i32(dst, 0);
+    GGML_ASSERT(n_iter > 0);
+
+    const int64_t n_tokens = logits->ne[1];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t dr  = (n_tokens + nth - 1) / nth;
+    const int64_t it0 = dr * ith;
+    const int64_t it1 = MIN(it0 + dr, n_tokens);
+
+    for (int64_t t = it0; t < it1; ++t) {
+        const char * s = (const char *) logits->data + t*nbs1;
+        float mix0 = *(const float *) (s + 4*nbs0);
+        float mix1 = *(const float *) (s + 5*nbs0);
+        float mix2 = *(const float *) (s + 6*nbs0);
+        float mix3 = *(const float *) (s + 7*nbs0);
+
+        for (int32_t i = 0; i < n_iter; ++i) {
+            ggml_mhc_normalize(mix0, mix1); // row 0
+            ggml_mhc_normalize(mix2, mix3); // row 1
+            ggml_mhc_normalize(mix0, mix2); // column 0
+            ggml_mhc_normalize(mix1, mix3); // column 1
+        }
+
+        char * d = (char *) dst->data + t*nbd1;
+        *(float *) (d + 0*nbd0) = expf(mix0);
+        *(float *) (d + 1*nbd0) = expf(mix1);
+        *(float *) (d + 2*nbd0) = expf(mix2);
+        *(float *) (d + 3*nbd0) = expf(mix3);
+    }
+}
+
+void ggml_compute_forward_mhc_sinkhorn(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    switch (dst->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_mhc_sinkhorn_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_mhc_merge
+//
+// Fused mHC residual merge (SenseNova-Loop): one node instead of eight
+// (mul/mul/add for the 2x2 mixture, mul/add for the branch injection).
+// Per element the arithmetic follows the reference chain
+//   next   = a*mix_k0 + b*mix_k1
+//   result = next + branch*post_k
+// with the same operation order and no reassociation. The compiler is free to contract
+// a*b+c into an FMA (as it may in the separate mul/add kernels' callers), so the result
+// can differ from the unfused chain by <= 1 ULP; measured effect: identical greedy text
+// on 2 of 3 test prompts, one token flip on a near-tie prompt.
+
+static void ggml_compute_forward_mhc_merge_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * a      = dst->src[0];
+    const ggml_tensor * b      = dst->src[1];
+    const ggml_tensor * branch = dst->src[2];
+    const ggml_tensor * post0  = dst->src[3];
+    const ggml_tensor * post1  = dst->src[4];
+    const ggml_tensor * mix0   = dst->src[5];
+    const ggml_tensor * mix1   = dst->src[6];
+    const ggml_tensor * mix2   = dst->src[7];
+    const ggml_tensor * mix3   = dst->src[8];
+
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && branch->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+    GGML_ASSERT(dst->ne[0] == a->ne[0] && dst->ne[1] == 2*a->ne[1]);
+
+    const int64_t n_embd = a->ne[0];
+    const int64_t n_tok  = a->ne[1];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const size_t nb_a1 = a->nb[1];
+    const size_t nb_b1 = b->nb[1];
+    const size_t nb_c1 = branch->nb[1];
+    const size_t nb_d1 = dst->nb[1];
+
+    for (int64_t t = 0; t < n_tok; ++t) {
+        const float * pa = (const float *) ((const char *) a->data      + t*nb_a1);
+        const float * pb = (const float *) ((const char *) b->data      + t*nb_b1);
+        const float * pc = (const float *) ((const char *) branch->data + t*nb_c1);
+
+        const float m0 = *(const float *) ((const char *) mix0->data + t*mix0->nb[1]);
+        const float m1 = *(const float *) ((const char *) mix1->data + t*mix1->nb[1]);
+        const float m2 = *(const float *) ((const char *) mix2->data + t*mix2->nb[1]);
+        const float m3 = *(const float *) ((const char *) mix3->data + t*mix3->nb[1]);
+
+        const float p0 = *(const float *) ((const char *) post0->data + t*post0->nb[1]);
+        const float p1 = *(const float *) ((const char *) post1->data + t*post1->nb[1]);
+
+        float * oa = (float *) ((char *) dst->data + t*nb_d1);
+        float * ob = (float *) ((char *) dst->data + (t + n_tok)*nb_d1);
+
+        for (int64_t i = ith; i < n_embd; i += nth) {
+            const float ai = pa[i];
+            const float bi = pb[i];
+            const float ci = pc[i];
+            const float na = ai*m0 + bi*m1;
+            const float nb = ai*m2 + bi*m3;
+            oa[i] = na + ci*p0;
+            ob[i] = nb + ci*p1;
+        }
+    }
+}
+
+void ggml_compute_forward_mhc_merge(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    switch (dst->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_mhc_merge_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+
+// ggml_compute_forward_mhc_route
+//
+// Fused mHC routing (SenseNova-Loop): concat + rms_norm + GEMV(2*n_embd -> 8) + bias +
+// sigmoid/mix/post injection + 2x2 Sinkhorn in a single node (~14 reference nodes).
+// Mirrors ggml_cuda/mhc-route.cu and uses the exact Sinkhorn arithmetic of
+// ggml_compute_forward_mhc_sinkhorn_f32 above, so the mix rows are bit-identical to
+// GGML_OP_MHC_SINKHORN. Only the GEMV accumulation order differs from the reference
+// mul_mat path (sequential per row here), which is a <= 1 ULP effect on the logits.
+static void ggml_compute_forward_mhc_route_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * a      = dst->src[0];
+    const ggml_tensor * b      = dst->src[1];
+    const ggml_tensor * weight = dst->src[2];
+    const ggml_tensor * bias   = dst->src[3];
+
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32);
+    GGML_ASSERT(weight->type == GGML_TYPE_F32 && bias->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->ne[0] == b->ne[0] && a->ne[1] == b->ne[1]);
+    GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1);
+    GGML_ASSERT(weight->ne[0] == 2*a->ne[0] && weight->ne[1] == 8);
+    GGML_ASSERT(bias->ne[0] == 8);
+    GGML_ASSERT(dst->ne[0] >= a->ne[0] + 6 && dst->ne[1] == a->ne[1]);
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+
+    const int64_t n_embd  = a->ne[0];
+    const int64_t n_flat  = 2*n_embd;
+    const int64_t n_tok   = a->ne[1];
+    const int32_t n_iter  = ggml_get_op_params_i32(dst, 0);
+    const float   pre_scale = ggml_get_op_params_f32(dst, 1);
+    GGML_ASSERT(n_iter > 0);
+
+    const float * p_bias = (const float *) bias->data;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    for (int64_t t = ith; t < n_tok; t += nth) {
+        const float * pa = (const float *) ((const char *) a->data   + t*a->nb[1]);
+        const float * pb = (const float *) ((const char *) b->data   + t*b->nb[1]);
+        float       * po = (float *)       ((char *)       dst->data + t*dst->nb[1]);
+
+        // rms_norm over flat = concat(a, b)
+        float ss = 0.0f;
+        for (int64_t i = 0; i < n_embd; ++i) { const float v = pa[i]; ss += v*v; }
+        for (int64_t i = 0; i < n_embd; ++i) { const float v = pb[i]; ss += v*v; }
+        const float rscale = 1.0f/sqrtf(ss/n_flat + 1e-6f);
+
+        // router logits
+        float logits[8];
+        for (int k = 0; k < 8; ++k) {
+            const float * w = (const float *) ((const char *) weight->data + k*weight->nb[1]);
+            float acc = 0.0f;
+            for (int64_t i = 0; i < n_embd; ++i) { acc += (pa[i]*rscale)*w[i]; }
+            for (int64_t i = 0; i < n_embd; ++i) { acc += (pb[i]*rscale)*w[n_embd + i]; }
+            logits[k] = acc + p_bias[k];
+        }
+
+        const float g0 = 1.0f/(1.0f + expf(-logits[0]));
+        const float g1 = 1.0f/(1.0f + expf(-logits[1]));
+
+        for (int64_t i = 0; i < n_embd; ++i) {
+            po[i] = (pa[i]*g0 + pb[i]*g1) * pre_scale;
+        }
+
+        po[n_embd + 0] = 2.0f * (1.0f/(1.0f + expf(-logits[2])));
+        po[n_embd + 1] = 2.0f * (1.0f/(1.0f + expf(-logits[3])));
+
+        float mix0 = logits[4];
+        float mix1 = logits[5];
+        float mix2 = logits[6];
+        float mix3 = logits[7];
+
+        for (int32_t i = 0; i < n_iter; ++i) {
+            ggml_mhc_normalize(mix0, mix1); // row 0
+            ggml_mhc_normalize(mix2, mix3); // row 1
+            ggml_mhc_normalize(mix0, mix2); // column 0
+            ggml_mhc_normalize(mix1, mix3); // column 1
+        }
+
+        po[n_embd + 2] = expf(mix0);
+        po[n_embd + 3] = expf(mix1);
+        po[n_embd + 4] = expf(mix2);
+        po[n_embd + 5] = expf(mix3);
+    }
+}
+
+void ggml_compute_forward_mhc_route(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    switch (dst->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_mhc_route_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
     }
 }

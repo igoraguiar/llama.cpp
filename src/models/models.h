@@ -55,6 +55,20 @@ struct llm_build_delta_net_base : public llm_graph_context {
             int64_t              conv_channels,
             int                  il);
 
+    // LLAMA_GDN_INPLACE: the recurrent state can be read from and written to the cache slot in
+    // place (single sequence, K == 1, no rollback snapshots, read row == write slot).
+    bool gdn_state_can_inplace(const llm_graph_input_rs * inp, const ggml_tensor * ssm_states_all, int64_t n_seqs) const;
+
+    // initial recurrent state (head_v_dim, head_v_dim, num_v_heads, n_seqs) for delta-net attention,
+    // read in place from the cache slot when possible, else gathered with build_rs()
+    ggml_tensor * build_gdn_state(
+            llm_graph_input_rs * inp,
+            ggml_tensor *        ssm_states_all,
+            int64_t              S_v,
+            int64_t              H_v,
+            int64_t              n_seqs,
+            int                  il);
+
     // run delta-net attention and write the new recurrent state(s) back to ssm_states_all
     // s: (head_v_dim, head_v_dim, num_v_heads, n_seqs); returns output: (head_v_dim, num_v_heads, n_seq_tokens, n_seqs)
     ggml_tensor * build_recurrent_attn(
@@ -66,7 +80,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
             ggml_tensor *        g,
             ggml_tensor *        b,
             ggml_tensor *        s,
-            int                  il);
+            int                  il,
+            bool                 inplace_state = false);
 };
 
 struct llm_build_lfm_base : public llm_graph_context {

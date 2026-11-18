@@ -2113,6 +2113,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv4_hc_post(params, tensor);
             } break;
+        case GGML_OP_MHC_SINKHORN:
+            {
+                ggml_compute_forward_mhc_sinkhorn(params, tensor);
+            } break;
+        case GGML_OP_MHC_MERGE:
+            {
+                ggml_compute_forward_mhc_merge(params, tensor);
+            } break;
+        case GGML_OP_MHC_ROUTE:
+            {
+                ggml_compute_forward_mhc_route(params, tensor);
+            } break;
         case GGML_OP_TOP_K_MASK:
             {
                 ggml_compute_forward_top_k_mask(params, tensor);
@@ -2299,6 +2311,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
+        case GGML_OP_MHC_SINKHORN:
+        case GGML_OP_MHC_MERGE:
+        case GGML_OP_MHC_ROUTE:
         case GGML_OP_TOP_K_MASK:
             {
                 n_tasks = n_threads;

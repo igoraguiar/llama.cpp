@@ -329,6 +329,12 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    // set when a layer reads/writes its recurrent state in place (GATED_DELTA_NET in-place):
+    // the graph then bypasses s_copy and is only valid while the gathered row is the head slot
+    bool gdn_inplace = false;
+
+    bool can_reuse_inplace(const llama_memory_recurrent_context * mctx_new) const;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
