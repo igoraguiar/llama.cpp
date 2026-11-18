@@ -409,6 +409,14 @@ extern "C" {
         size_t moe_cache_size;      // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
         float  moe_cache_cpu_share; // share of the MoE cache misses computed on the CPU instead of uploaded, 0 = all uploaded [EXPERIMENTAL]
 
+        // draft-only low-bit copy of the LM head, created and used by the MTP draft context only
+        // the target context keeps using the full-precision head for verification
+        enum ggml_type draft_head_type; // quant type for the draft head copy, GGML_TYPE_COUNT = disabled [EXPERIMENTAL]
+
+        // MTP draft context only: score just the token ids [0, draft_n_vocab) with the draft head
+        // (BPE ids are roughly in frequency order); verification keeps the full vocabulary. 0 = full
+        int32_t draft_n_vocab;
+
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
         // currently works only with CPU execution
@@ -1570,6 +1578,16 @@ extern "C" {
                             size_t num_trigger_patterns,
                const llama_token * trigger_tokens,
                             size_t num_trigger_tokens);
+
+    /// @details True if smpl is a lazy grammar sampler that has not met its trigger yet: until then it accepts every
+    ///          token and leaves the candidates unchanged. False for any other sampler and for NULL.
+    LLAMA_API bool llama_sampler_grammar_awaiting_trigger(const struct llama_sampler * smpl);
+
+    /// @details For a sampler chain that was attached to a context with llama_set_sampler() and has been detached
+    ///          (llama_set_sampler with NULL): forget the backend part, so that applying the chain runs all of its
+    ///          samplers on the CPU again (an attached chain skips the samplers the backend ran). A released chain
+    ///          must not be attached again. No-op for other samplers.
+    LLAMA_API void llama_sampler_chain_backend_release(struct llama_sampler * chain);
 
 
     /// NOTE: Avoid using on the full vocabulary as searching for repeated tokens can become slow. For example, apply top-k or top-p sampling first.

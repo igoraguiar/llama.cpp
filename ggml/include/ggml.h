@@ -325,6 +325,7 @@ extern "C" {
         GGML_OP_DUP,
         GGML_OP_ADD,
         GGML_OP_ADD_ID,
+        GGML_OP_ADD1,
         GGML_OP_ACC,
         GGML_OP_SUB,
         GGML_OP_MUL,
@@ -366,6 +367,8 @@ extern "C" {
         GGML_OP_GET_ROWS_BACK,
         GGML_OP_SET_ROWS,
         GGML_OP_DIAG,
+        GGML_OP_DIAG_MASK_INF,
+        GGML_OP_DIAG_MASK_ZERO,
         GGML_OP_SOFT_MAX,
         GGML_OP_SOFT_MAX_BACK,
         GGML_OP_ROPE,
@@ -408,6 +411,8 @@ extern "C" {
         GGML_OP_RWKV_WKV7,
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
+        GGML_OP_GATED_DELTA_NET_REPLAY,
+        GGML_OP_DFLASH_CONV,
         GGML_OP_LIGHTNING_INDEXER,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
@@ -741,6 +746,18 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+    GGML_DEPRECATED(GGML_API struct ggml_tensor * ggml_add1(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b),
+        "use ggml_add instead");
+
+    GGML_DEPRECATED(GGML_API struct ggml_tensor * ggml_add1_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b),
+        "use ggml_add_inplace instead");
 
     GGML_API struct ggml_tensor * ggml_add_cast(
             struct ggml_context * ctx,
@@ -1577,6 +1594,30 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_diag(
         struct ggml_context     * ctx,
         struct ggml_tensor      * a);
+
+    // set elements above the diagonal to -INF
+    GGML_API struct ggml_tensor * ggml_diag_mask_inf(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   n_past);
+
+    // in-place, returns view(a)
+    GGML_API struct ggml_tensor * ggml_diag_mask_inf_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   n_past);
+
+    // set elements above the diagonal to 0
+    GGML_API struct ggml_tensor * ggml_diag_mask_zero(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   n_past);
+
+    // in-place, returns view(a)
+    GGML_API struct ggml_tensor * ggml_diag_mask_zero_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   n_past);
 
     GGML_API struct ggml_tensor * ggml_clamp(
             struct ggml_context * ctx,
@@ -2430,6 +2471,40 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    // gated delta net that logs its state updates instead of writing state snapshots: rollback by replay
+    //   q, k, v, g, beta, state : as ggml_gated_delta_net
+    //   log      : [E, R, n_seqs] update log of the previous call, R >= 1 entries of E floats each:
+    //              k [S_k*H_k] | delta [S_v*H_v] | exp(g) [H_v, or S_v*H_v for KDA]
+    //   n_replay : I32 [n_seqs], number of log entries applied to state before the first token (<= R)
+    //
+    // with m = min(n_tokens, R), the output packs the attention scores [S_v, H_v, n_tokens, n_seqs], the state
+    // before token n_tokens-m [S_v, S_v, H_v, n_seqs] and the log of the last m tokens [E, R, n_seqs] (entries
+    // m..R-1 are zero). the state after the first n_tokens-m+j tokens is that state with j log entries applied:
+    // s = fma(k, delta, exp(g)*s) per element, the same expression as the token update.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_replay(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * log,
+            struct ggml_tensor  * n_replay);
+
+    // DFlash2 block convolution: a depthwise convolution over the previous tokens of the same block, whose weight is a
+    // static part plus a per-token coefficient shared by each group of channels
+    //   x    : [C, T]       T = n_blocks * block_size tokens
+    //   dyn  : [C/G, K, T]  coefficient per group of G channels, tap and token
+    //   base : [C, K]       static weight per channel and tap
+    //   res[c, t] = sum over k < K of (dyn[c/G, k, t] + base[c, k]) * x[c, t - k], with x = 0 before the block of t
+    GGML_API struct ggml_tensor * ggml_dflash_conv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * dyn,
+            struct ggml_tensor  * base,
+            int                   block_size);
 
     // DSA lightning indexer
     //

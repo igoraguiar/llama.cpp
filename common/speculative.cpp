@@ -69,6 +69,87 @@ static void spec_retune(
     smpls[seq_id].reset(common_sampler_init(model, sparams));
 }
 
+// nucleus truncation of a normalized distribution: keep the smallest set of the largest probabilities
+// whose share reaches top_p, zero the rest and renormalize. rejection sampling stays exact as long as
+// the verification uses the q the token was drawn from, so the truncated q is the one to keep
+static void common_speculative_q_top_p(std::vector<float> & p, float top_p) {
+    if (top_p >= 1.0f || p.size() < 2) {
+        return;
+    }
+    std::vector<uint32_t> ord(p.size());
+    for (uint32_t k = 0; k < ord.size(); ++k) {
+        ord[k] = k;
+    }
+    std::sort(ord.begin(), ord.end(), [&p](uint32_t a, uint32_t b) {
+        return p[a] > p[b] || (p[a] == p[b] && a < b);
+    });
+    double cum = 0.0;
+    size_t keep = ord.size();
+    for (size_t j = 0; j < ord.size(); ++j) {
+        cum += p[ord[j]];
+        if (cum >= (double) top_p) {
+            keep = j + 1;
+            break;
+        }
+    }
+    double kept = 0.0;
+    for (size_t j = 0; j < ord.size(); ++j) {
+        if (j < keep) {
+            kept += p[ord[j]];
+        } else {
+            p[ord[j]] = 0.0f;
+        }
+    }
+    if (kept > 0.0) {
+        for (auto & e : p) {
+            e = (float) (e / kept);
+        }
+    }
+}
+
+// samples from the nucleus truncation of the draft candidates (see common_speculative_q_top_p) and
+// writes the truncated distribution to q, so the verification weighs the token against the q it was drawn from
+static llama_token common_speculative_sample_top_p(const llama_token_data_array * cur_p, float top_p,
+        std::mt19937 & rng, std::vector<llama_token_data> & q) {
+    q.assign(cur_p->data, cur_p->data + cur_p->size);
+    std::vector<float> p(cur_p->size);
+    for (size_t k = 0; k < cur_p->size; ++k) {
+        p[k] = cur_p->data[k].p;
+    }
+    common_speculative_q_top_p(p, top_p);
+
+    std::uniform_real_distribution<double> unif(0.0, 1.0);
+    double u = unif(rng);
+    for (size_t k = 0; k < q.size(); ++k) {
+        q[k].p = p[k];
+        if (p[k] <= 0.0f) {
+            continue;
+        }
+        u -= p[k];
+        if (u <= 0.0) {
+            return q[k].id;
+        }
+    }
+    // a round-off overshoot keeps the largest kept probability
+    for (size_t k = 0; k < q.size(); ++k) {
+        if (p[k] > 0.0f) {
+            return q[k].id;
+        }
+    }
+    return q[0].id;
+}
+
+// set by common_speculative_draft_overlap for the duration of one draft call
+static std::function<void()> g_draft_on_submit;
+
+static void common_speculative_on_submit() {
+    if (g_draft_on_submit) {
+        auto f = std::move(g_draft_on_submit);
+        g_draft_on_submit = nullptr;
+        f();
+    }
+}
+
 const std::map<std::string, common_speculative_type> common_speculative_type_from_name_map = {
     {"none",           COMMON_SPECULATIVE_TYPE_NONE},
     {"draft-simple",   COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
@@ -1321,6 +1402,7 @@ public:
             LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
             return;
         }
+        common_speculative_on_submit();
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
@@ -1446,6 +1528,7 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
             LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
             return;
         }
+        common_speculative_on_submit();
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
@@ -1567,6 +1650,7 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
             LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
             return;
         }
+        common_speculative_on_submit();
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
@@ -1619,6 +1703,11 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
                     for (int32_t k = 0; k < top_k; ++k) {
                         probs[k] /= sum;
                     }
+                }
+                if (sample && dp.top_p_q < 1.0f) {
+                    // nucleus truncation of the draft q: the verification uses the truncated q the token
+                    // is drawn from, so the output distribution is unchanged
+                    common_speculative_q_top_p(probs, dp.top_p_q);
                 }
                 if (sample) {
                     // ggml_top_k leaves candidates unordered, so walk them by token id to keep a seed's draft stable
@@ -1748,6 +1837,7 @@ public:
             LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
             return;
         }
+        common_speculative_on_submit();
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
@@ -1798,6 +1888,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<common_sampler_ptr> smpls;
 
     std::vector<common_params_sampling> smpls_cfg;
+
+    std::vector<std::mt19937> rngs; // draft-q sampling with nucleus truncation (top_p_q < 1)
 
     // backend sampler chain per seq, attached to ctx_dft
     std::vector<llama_sampler *> backend_chains;
@@ -1943,6 +2035,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        // a request's draft-q draws start from the same state, so its text does not depend on earlier requests
+        if (rngs.size() < n_seq) {
+            rngs.resize(n_seq);
+        }
+        rngs[seq_id].seed(0x5eedu + seq_id);
+
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
 
@@ -2202,7 +2300,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 // add drafted token for each sequence
-                const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
+                auto & dp = dparams.at(seq_id);
+                llama_token id = dp.result_q ? id_sampled : cur_p->data[0].id;
+                std::vector<llama_token_data> q_trunc;
+                if (dp.result_q && dp.top_p_q < 1.0f) {
+                    // resample from the truncated q, so the recorded q is the distribution the token was drawn from
+                    id = common_speculative_sample_top_p(cur_p, dp.top_p_q, rngs[seq_id], q_trunc);
+                }
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
@@ -2214,13 +2318,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 common_sampler_accept(smpl, id, true);
 
-                auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
                 result.push_back(id);
 
                 if (dp.result_q) {
-                    dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+                    if (dp.top_p_q < 1.0f) {
+                        dp.result_q->push_back(std::move(q_trunc));
+                    } else {
+                        dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+                    }
                 }
 
                 if (params.n_max <= (int) result.size()) {
@@ -3517,6 +3624,12 @@ void common_speculative_draft(common_speculative * spec) {
             dp.drafting = false;
         }
     }
+}
+
+void common_speculative_draft_overlap(common_speculative * spec, const std::function<void()> & on_submit) {
+    g_draft_on_submit = on_submit;
+    common_speculative_draft(spec);
+    common_speculative_on_submit();
 }
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {

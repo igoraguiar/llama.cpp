@@ -159,3 +159,11 @@ LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
 
 // each sequence is paired with an unconditional one at n_seq_max / 2 + seq_id, in a unified KV cache
 LLAMA_API bool llama_model_classifier_free_guidance(const struct llama_model * model);
+
+// rescores k token ids against the full LM head: out[i] = dot(rms_norm(h), W[:, ids[i]])
+// h is one pre-norm hidden row of h_n floats. returns rows scored, 0 on error.
+// returns 0 (caller keeps the cheap pick) for heads this cannot read
+// (LoRA output scale, non-plain dtypes). used to rerank cheap-head MTP drafts.
+LLAMA_API int32_t llama_model_rescore_head_rows(
+        const struct llama_model * model, const float * h, int32_t h_n,
+        const int32_t * ids, float * out, int32_t k);

@@ -1009,6 +1009,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DUP",
     "ADD",
     "ADD_ID",
+    "ADD1",
     "ACC",
     "SUB",
     "MUL",
@@ -1050,6 +1051,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GET_ROWS_BACK",
     "SET_ROWS",
     "DIAG",
+    "DIAG_MASK_INF",
+    "DIAG_MASK_ZERO",
     "SOFT_MAX",
     "SOFT_MAX_BACK",
     "ROPE",
@@ -1092,6 +1095,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "RWKV_WKV7",
     "SOLVE_TRI",
     "GATED_DELTA_NET",
+    "GATED_DELTA_NET_REPLAY",
+    "DFLASH_CONV",
     "LIGHTNING_INDEXER",
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
@@ -1114,7 +1119,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1205,6 +1210,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rwkv_wkv7(r, w, k, v, a, b, s)",
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
+    "gated_delta_net_replay(q, k, v, g, beta, s, log, n)",
+    "dflash_conv(x, dyn, base)",
     "lightning_indexer(q, k, weights, mask)",
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
@@ -1227,7 +1234,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2104,6 +2111,32 @@ struct ggml_tensor * ggml_add_inplace(
         struct ggml_tensor  * a,
         struct ggml_tensor  * b) {
     return ggml_add_impl(ctx, a, b, true);
+}
+
+// ggml_add1
+
+static struct ggml_tensor * ggml_add1_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        bool                  inplace) {
+    GGML_ASSERT(ggml_is_scalar(b));
+    GGML_ASSERT(ggml_is_padded_1d(a));
+
+    struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
+
+    result->op     = GGML_OP_ADD1;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_add1(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    return ggml_add1_impl(ctx, a, b, false);
 }
 
 // ggml_add_cast
@@ -4045,6 +4078,70 @@ struct ggml_tensor * ggml_diag(
     result->src[0] = a;
 
     return result;
+}
+
+// ggml_diag_mask_inf
+
+static struct ggml_tensor * ggml_diag_mask_inf_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   n_past,
+        bool                  inplace) {
+    struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
+
+    int32_t params[] = { n_past };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_DIAG_MASK_INF;
+    result->src[0] = a;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_diag_mask_inf(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   n_past) {
+    return ggml_diag_mask_inf_impl(ctx, a, n_past, false);
+}
+
+struct ggml_tensor * ggml_diag_mask_inf_inplace(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   n_past) {
+    return ggml_diag_mask_inf_impl(ctx, a, n_past, true);
+}
+
+// ggml_diag_mask_zero
+
+static struct ggml_tensor * ggml_diag_mask_zero_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   n_past,
+        bool                  inplace) {
+    struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
+
+    int32_t params[] = { n_past };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_DIAG_MASK_ZERO;
+    result->src[0] = a;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_diag_mask_zero(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   n_past) {
+    return ggml_diag_mask_zero_impl(ctx, a, n_past, false);
+}
+
+struct ggml_tensor * ggml_diag_mask_zero_inplace(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   n_past) {
+    return ggml_diag_mask_zero_impl(ctx, a, n_past, true);
 }
 
 // ggml_clamp
@@ -6300,15 +6397,13 @@ struct ggml_tensor * ggml_solve_tri(
 
 // ggml_gated_delta_net
 
-struct ggml_tensor * ggml_gated_delta_net(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * q,
-        struct ggml_tensor  * k,
-        struct ggml_tensor  * v,
-        struct ggml_tensor  * g,
-        struct ggml_tensor  * beta,
-        struct ggml_tensor  * state,
-        int64_t               K) {
+static void ggml_gated_delta_net_check(
+        const struct ggml_tensor * q,
+        const struct ggml_tensor * k,
+        const struct ggml_tensor * v,
+        const struct ggml_tensor * g,
+        const struct ggml_tensor * beta,
+        const struct ggml_tensor * state) {
     GGML_ASSERT(ggml_is_contiguous_rows(q));
     GGML_ASSERT(ggml_is_contiguous_rows(k));
     GGML_ASSERT(ggml_is_contiguous_rows(v));
@@ -6323,20 +6418,38 @@ struct ggml_tensor * ggml_gated_delta_net(
     GGML_ASSERT(beta->type == GGML_TYPE_F32);
     GGML_ASSERT(state->type == GGML_TYPE_F32);
 
-    const int64_t S_v      = v->ne[0];
-    const int64_t H        = v->ne[1];
-    const int64_t n_tokens = v->ne[2];
-    const int64_t n_seqs   = v->ne[3];
+    const int64_t S_v    = v->ne[0];
+    const int64_t H      = v->ne[1];
+    const int64_t n_seqs = v->ne[3];
 
     // gate: scalar [1, H, T, B] or vector [S_v, H, T, B] (KDA)
     GGML_ASSERT(g->ne[0] == 1 || g->ne[0] == S_v);
     GGML_ASSERT(beta->ne[0] == 1);
 
-    // state holds the initial state s0 only: [S_v, S_v, H, n_seqs]. K (snapshot slot count) is an op param.
+    // state holds the initial state s0 only: [S_v, S_v, H, n_seqs]
     GGML_ASSERT(state->ne[0] == S_v);
     GGML_ASSERT(state->ne[1] == S_v);
     GGML_ASSERT(state->ne[2] == H);
     GGML_ASSERT(state->ne[3] == n_seqs);
+}
+
+struct ggml_tensor * ggml_gated_delta_net(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        int64_t               K) {
+    ggml_gated_delta_net_check(q, k, v, g, beta, state);
+
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+
+    // K (snapshot slot count) is an op param
     GGML_ASSERT(K >= 1);
     const int64_t state_rows = K * S_v * n_seqs;
     const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + state_rows, 1, 1 };
@@ -6351,6 +6464,82 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+
+    return result;
+}
+
+// ggml_dflash_conv
+
+struct ggml_tensor * ggml_dflash_conv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * dyn,
+        struct ggml_tensor  * base,
+        int                   block_size) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && dyn->type == GGML_TYPE_F32 && base->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->nb[0] == sizeof(float) && dyn->nb[0] == sizeof(float) && base->nb[0] == sizeof(float));
+
+    const int64_t C = x->ne[0];
+    const int64_t T = x->ne[1];
+    const int64_t K = base->ne[1];
+
+    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(base->ne[0] == C && base->ne[2] == 1 && base->ne[3] == 1);
+    GGML_ASSERT(dyn->ne[0] > 0 && C % dyn->ne[0] == 0 && dyn->ne[1] == K && dyn->ne[2] == T && dyn->ne[3] == 1);
+    GGML_ASSERT(block_size > 0 && T % block_size == 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, T);
+
+    ggml_set_op_params_i32(result, 0, block_size);
+
+    result->op     = GGML_OP_DFLASH_CONV;
+    result->src[0] = x;
+    result->src[1] = dyn;
+    result->src[2] = base;
+
+    return result;
+}
+
+// ggml_gated_delta_net_replay
+
+struct ggml_tensor * ggml_gated_delta_net_replay(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * log,
+        struct ggml_tensor  * n_replay) {
+    ggml_gated_delta_net_check(q, k, v, g, beta, state);
+
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+    const int64_t E        = q->ne[0]*q->ne[1] + S_v*H + g->ne[0]*H;
+
+    // the log holds one k per q/k head
+    GGML_ASSERT(k->ne[1] == q->ne[1]);
+    GGML_ASSERT(log->type == GGML_TYPE_F32 && ggml_is_contiguous(log));
+    GGML_ASSERT(log->ne[0] == E && log->ne[1] >= 1 && log->ne[2] == n_seqs && log->ne[3] == 1);
+    GGML_ASSERT(n_replay->type == GGML_TYPE_I32 && ggml_is_contiguous(n_replay));
+    GGML_ASSERT(n_replay->ne[0] == n_seqs && ggml_nelements(n_replay) == n_seqs);
+
+    // attention scores, then one state per seq, then the log
+    const int64_t ne0 = S_v*H*n_tokens*n_seqs + S_v*S_v*H*n_seqs + E*log->ne[1]*n_seqs;
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne0);
+
+    result->op     = GGML_OP_GATED_DELTA_NET_REPLAY;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = state;
+    result->src[6] = log;
+    result->src[7] = n_replay;
 
     return result;
 }
@@ -6749,6 +6938,14 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc1, tmp);
             }
         } break;
+        case GGML_OP_ADD1: {
+            if (src0_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc0, grad);
+            }
+            if (src1_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc1, ggml_mean(ctx, grad)); // TODO: should probably be sum instead of mean
+            }
+        } break;
         case GGML_OP_ACC: {
             if (src0_needs_grads) {
                 ggml_add_or_set(ctx, cgraph, isrc0, grad);
@@ -7024,6 +7221,20 @@ static void ggml_compute_backward(
         case GGML_OP_TRI: {
             if (src0_needs_grads) {
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_tri(ctx, grad, (enum ggml_tri_type) ggml_get_op_params_i32(tensor, 0)));
+            }
+        } break;
+        case GGML_OP_DIAG_MASK_INF: {
+            if (src0_needs_grads) {
+                /* ggml_diag_mask_inf_impl() shouldn't be here */
+                /* ref:  https://github.com/ggml-org/llama.cpp/pull/4203#discussion_r1412377992 */
+                const int n_past = ((const int32_t *) tensor->op_params)[0];
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_diag_mask_zero_impl(ctx, grad, n_past, false));
+            }
+        } break;
+        case GGML_OP_DIAG_MASK_ZERO: {
+            if (src0_needs_grads) {
+                const int n_past = ((const int32_t *) tensor->op_params)[0];
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_diag_mask_zero_impl(ctx, grad, n_past, false));
             }
         } break;
         case GGML_OP_SOFT_MAX: {

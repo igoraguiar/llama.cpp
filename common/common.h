@@ -352,6 +352,14 @@ struct common_params_speculative_draft {
 
     bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
 
+    // draft-only low-bit copy of the LM head (MTP draft contexts only)
+    ggml_type head_type = GGML_TYPE_COUNT; // quant type for the draft head copy (GGML_TYPE_COUNT = disabled)
+
+    int32_t n_vocab = 0; // MTP draft head scores token ids [0, n_vocab) only (0 = full vocabulary)
+
+    // exact top-k rerank of cheap-head drafts with the full head (0 = off)
+    int32_t rerank_k = 0; // number of cheap-head candidates rescored per draft step
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;
@@ -395,6 +403,11 @@ struct common_params_speculative {
 
     double synth_len = -1.0;
     std::vector<double> synth_rates;
+
+    bool  accept_rejection = false; // lossless rejection-sampling verification instead of exact match (MTP draft)
+    bool  accept_block     = false; // rejection sampling with block verification (one joint test over the draft)
+    float draft_temp       = 1.0f;  // temperature of the draft distribution q for rejection sampling
+    float draft_top_p      = 1.0f;  // nucleus truncation of the draft distribution q before sampling (1 = off)
 
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;

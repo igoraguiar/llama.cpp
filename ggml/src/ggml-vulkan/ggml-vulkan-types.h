@@ -62,6 +62,8 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
+
 #include <shared_mutex>
 #include <mutex>
 #include <future>
@@ -250,6 +252,8 @@ struct vk_pipeline_struct {
     // linked list of pipelines for multiple compilation variants.
     // currently only used to compile a 64-bit indexing variant.
     vk_pipeline next;
+    // mat-vecs: the same shader with the epilogue compiled in (MMV_EPILOGUE spec constant, ggml_vk_match_mmv_epilogue)
+    vk_pipeline epi;
 };
 
 typedef std::weak_ptr<vk_pipeline_struct> vk_pipeline_ref;
@@ -278,6 +282,7 @@ struct vk_tile_config {
     std::array<uint32_t, 3> wg_denoms;
     uint32_t align;
     uint32_t narrow_n_max = 0;
+    uint32_t pin_sg = 0; // nonzero: the pipelines require this subgroup size (full subgroups)
 };
 
 using matmul_tile_selector_t = std::function<uint32_t(
@@ -319,6 +324,9 @@ struct vk_command_pool {
     std::deque<vk_command_buffer> cmd_buffers;
 
     vk_queue *q;
+
+    // command buffers are recorded without one-time-submit, so they can be submitted again (vk_graph_replay)
+    bool reusable = false;
 
     size_t buffers_in_use() const {
         return std::count_if(cmd_buffers.begin(), cmd_buffers.end(),
@@ -413,6 +421,10 @@ enum FaCodePath {
     FA_SCALAR,
     FA_COOPMAT1,
     FA_COOPMAT2,
+    // coopmat1 for small grouped-query batches, output kept in accumulators (flash_attn_cm1_gqa.comp)
+    FA_COOPMAT1_GQA,
+    // coopmat1 for grouped-query prompt batches, 64 query rows per workgroup (flash_attn_cm1_gqa_pp.comp)
+    FA_COOPMAT1_GQA_PP,
 };
 
 struct vk_fa_pipeline_state {
@@ -557,6 +569,8 @@ static constexpr std::initializer_list<std::array<int, 3>> topk_qsa_edges {
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_add_mul_pattern { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL };
 
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_add_pattern     { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD };
+// norm(x) * w * gate, e.g. the gated output norm of a delta-net layer
+static constexpr std::initializer_list<ggml_op> rms_norm_mul_mul_pattern     { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL };
 
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_rope_view_set_rows_pattern { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
 
@@ -647,6 +661,8 @@ enum rms_norm_mode {
     RMS_NORM_MUL,
     RMS_NORM_MUL_ADD,
     RMS_NORM_MUL_ADD_MUL,
+    RMS_NORM_MUL_MUL,
+    RMS_NORM_SCALE,
     RMS_NORM_MUL_ROPE,
     RMS_NORM_MUL_ROPE_VIEW_SET_ROWS,
     RMS_NORM_VIEW_SET_ROWS,
@@ -884,6 +900,10 @@ struct vk_device_struct {
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_f32;
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_add_f32;
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_add_mul_f32;
+    vk_pipeline pipeline_rms_norm_mul_q8_1_f32[2];      // rows up to 512, up to 8192 values
+    vk_pipeline pipeline_rms_norm_mul_mul_f32;
+    vk_pipeline pipeline_rms_norm_scale_f32;
+    vk_pipeline pipeline_rms_norm_mul_mul_q8_1_f32[2];
     vk_pipeline pipeline_rms_norm_mul_add_partials_f32;
     vk_pipeline pipeline_rms_norm_mul_add_mul_partials_f32;
     vk_pipeline pipeline_rms_norm_set_rows_f32_f32;
@@ -938,6 +958,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_geglu[2];
     vk_pipeline pipeline_reglu[2];
     vk_pipeline pipeline_swiglu[2];
+    vk_pipeline pipeline_swiglu_q8_1_f32;
     vk_pipeline pipeline_swiglu_oai[2];
     vk_pipeline pipeline_swiglu_clamp[2];
     vk_pipeline pipeline_geglu_erf[2];
@@ -1002,11 +1023,14 @@ struct vk_device_struct {
     vk_pipeline pipeline_lightning_indexer_f32[GGML_TYPE_COUNT];
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
+    vk_pipeline pipeline_gated_delta_net_replay[4][2];
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
+    vk_pipeline pipeline_dflash_conv_f32;
+    vk_pipeline pipeline_ssm_conv_state_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1038,6 +1062,10 @@ struct vk_device_struct {
 
     vk::Fence fence;
     vk_buffer sync_staging;
+
+    // bumped whenever a buffer of this device is destroyed: recorded command buffers that bind buffers by handle
+    // are stale after that (vk_graph_replay)
+    std::atomic<uint64_t> buffer_epoch {0};
 
     ggml_backend_buffer_type buffer_type;
 
@@ -1093,6 +1121,7 @@ struct vk_buffer_struct {
 
         // bump before destroying, so a thread that sees the buffer gone also sees the new count
         device->buffer_destroy_count.fetch_add(1, std::memory_order_release);
+        device->buffer_epoch.fetch_add(1, std::memory_order_relaxed);
         device->device.freeMemory(device_memory);
         device->device.destroyBuffer(buffer);
     }
@@ -1142,6 +1171,20 @@ typedef std::vector<vk_submission> vk_sequence;
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+
+// mat-vec epilogue (ggml_vk_match_mmv_epilogue): bias0 holds one value per row for every column, then an
+// activation, then a multiply by fuse1, one value per row
+#define MAT_VEC_FUSION_FLAGS_BIAS0_ROW    0x10
+#define MAT_VEC_FUSION_FLAGS_SCALE1_ROW   0x20
+#define MAT_VEC_FUSION_FLAGS_ACT_SOFTPLUS 0x40
+#define MAT_VEC_FUSION_FLAGS_ACT_SIGMOID  0x80
+#define MAT_VEC_FUSION_FLAGS_ACT_SILU     0x100
+
+struct vk_mmv_epilogue {
+    uint32_t flags = 0;                // MAT_VEC_FUSION_FLAGS_*, 0 when the fused nodes are ADDs (the bias path)
+    const ggml_tensor * fuse0 = nullptr;
+    const ggml_tensor * fuse1 = nullptr;
+};
 
 struct vk_staging_memcpy {
     vk_staging_memcpy(void * _dst, const void * _src, size_t _n) : dst(_dst), src(_src), n(_n) {}
@@ -1281,6 +1324,65 @@ class vk_perf_logger {
     uint32_t print_count {};
 };
 
+// conv of a recurrent layer with its state path (get_rows of the conv cache, concat with the new inputs, snapshot
+// copies of the state windows back into the cache) run as one kernel at the concat (ssm_conv_state.comp)
+// gated_delta_net_replay that reads its state and log from the cache rows and writes them back itself
+// (ggml_vk_match_gdn_replay): the gathering get_rows and the cpy / set_rows into the cache are skipped
+struct vk_gdn_replay_fusion {
+    const ggml_tensor * state_rows = nullptr; // get_rows of the state cache
+    const ggml_tensor * log_rows   = nullptr; // get_rows of the log cache
+    const ggml_tensor * state_cpy  = nullptr; // cpy of the new state into the state cache rows
+    const ggml_tensor * log_set    = nullptr; // set_rows of the new log into the log cache
+};
+
+// the delta-net q/k L2 norm (rms_norm + scale, views q and k of its output) done inside gated_delta_net
+struct vk_gdn_qk_norm_fusion {
+    const ggml_tensor * x     = nullptr; // input of the norm: q heads, then k heads
+    const ggml_tensor * norm  = nullptr;
+    const ggml_tensor * scale = nullptr;
+    int64_t n_q   = 0;    // q heads (k starts n_q rows of x later)
+    float   eps   = 0.0f;
+    float   s     = 0.0f;
+};
+
+struct vk_conv_state_fusion {
+    const ggml_tensor * rows = nullptr; // get_rows of the conv cache
+    const ggml_tensor * x    = nullptr; // new inputs [channels, n_t, n_s]
+    const ggml_tensor * conv = nullptr; // ssm_conv
+    const ggml_tensor * silu = nullptr; // its silu, the output
+    std::vector<const ggml_tensor *> cpys;
+    std::vector<uint32_t> snap_src;     // first input of each snapshot window
+    std::vector<uint32_t> snap_row;     // cache row of each snapshot (sequence 0)
+    bool stage_x = false;               // the kernel reads a copy of x in prealloc_x (the output overlaps x)
+    uint32_t orbit = 1;                 // the output overlaps x in place: channels per orbit, see ssm_conv_state.comp
+    bool sync = false;                  // barrier between the kernel's reads and writes
+};
+
+// a recorded graph that graph_compute submits again, unchanged, while it gets graphs whose nodes match (GGML_VK_GRAPH_REPLAY)
+struct vk_graph_replay {
+    // key (ggml_vk_replay_key): what the recording read, the switches, the nodes, the fields of the nodes and of the
+    // tensors they read, and the use counts of the graph
+    uint64_t cfg[3] = {};
+    std::vector<const ggml_tensor *> nodes;
+    std::vector<const ggml_tensor *> ext;  // sources and view sources that are not nodes of the graph, each once
+    std::vector<uint8_t> fields;           // the fields before the name, of each node, then of each of ext
+    std::vector<std::pair<const ggml_tensor *, int32_t>> uses; // used slots of the graph's hash set, in slot order
+    uint64_t uid = 0;                      // uid of the last graph that matched the key (0: none)
+    uint64_t epoch = 0;                    // device buffer_epoch at recording
+    vk_command_pool pool;                  // reusable, its own: the context pool is reset after every graph
+    std::vector<vk::CommandBuffer> cmd_bufs; // in submission order
+    // its own descriptor sets: the context's sets are rewritten by every recorded graph
+    std::vector<vk::DescriptorPool> descriptor_pools;
+    std::vector<vk::DescriptorSet> descriptor_sets;
+    // while recording, the context's descriptor set index and requirement are parked here
+    uint32_t set_idx = 0;
+    uint32_t set_req = 0;
+    uint64_t last_use = 0;
+    bool valid = false;
+    bool in_flight = false;                // submitted, not waited for yet
+    bool ok = false;                       // set while recording: nothing seen that a resubmission would not repeat
+};
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -1297,10 +1399,14 @@ struct ggml_backend_vk_context {
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
+    // ggml_backend_vk_flush submitted the recorded work with `fence`; the next synchronize waits on it
+    bool flush_fence_pending {};
+    vk_command_buffer * flush_cmd_buf {};
     // Set before op_add and unset after op_rms_norm to indicate that the add should
     // write partial sums to accumulate the square of the vector components
     bool do_add_rms_partials_offset_calculation;
     bool do_add_rms_partials;
+    bool op_q8_1_out = false; // the next ggml_vk_op_f32 dispatch also writes a q8_1 copy of dst into prealloc_y
 
     uint64_t last_total_flops {UINT64_MAX};
 
@@ -1313,6 +1419,15 @@ struct ggml_backend_vk_context {
     // Track which nodes have been used since the last sync, and whether they were written to
     std::vector<const ggml_tensor *> unsynced_nodes_written;
     std::vector<const ggml_tensor *> unsynced_nodes_read;
+    // nodes a fused kernel elsewhere in the graph covers, so they are not dispatched (the gdn state get_rows,
+    // ggml_vk_gdn_state_rows; the conv state path, ggml_vk_match_conv_state), and the concats that run the fused
+    // conv state kernel
+    std::unordered_set<const ggml_tensor *> fused_skip;
+    // gated_delta_net -> the get_rows of the state cache it reads in place
+    std::unordered_map<const ggml_tensor *, const ggml_tensor *> gdn_state_fusions;
+    std::unordered_map<const ggml_tensor *, vk_conv_state_fusion> conv_state_fusions;
+    std::unordered_map<const ggml_tensor *, vk_gdn_replay_fusion> gdn_replay_fusions;
+    std::unordered_map<const ggml_tensor *, vk_gdn_qk_norm_fusion> gdn_qk_norm_fusions;
     // Track which prealloc buffers have pending reads that need to be synchronized.
     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),
     // and set to true after the buffer contents are consumed.
@@ -1337,6 +1452,12 @@ struct ggml_backend_vk_context {
     vk_command_pool compute_cmd_pool;
     vk_command_pool transfer_cmd_pool;
 
+    // GGML_VK_GRAPH_REPLAY: recorded graphs, least recently used replaced first; while one is being recorded,
+    // compute contexts take their command buffers from its pool
+    std::vector<std::unique_ptr<vk_graph_replay>> replays;
+    vk_graph_replay * replay_rec {};
+    uint64_t replay_clock {};
+
     // number of additional consecutive nodes that are being fused with the
     // node currently being processed
     int num_additional_fused_ops {};
@@ -1350,6 +1471,14 @@ struct ggml_backend_vk_context {
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
+    // the nodes after the current mat-vec that run in its epilogue
+    vk_mmv_epilogue mmv_epi;
+
+    // for GGML_VK_GPU_SPAN: GPU timestamps at the start and the end of each graph
+    vk::QueryPool span_pool;
+    bool span_open {};    // start stamp recorded, end stamp not yet
+    bool span_pending {}; // both stamps submitted, results not read yet
+    int  span_cls {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;

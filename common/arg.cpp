@@ -4259,6 +4259,45 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_SPLIT"));
     add_opt(common_arg(
+        {"--spec-accept"}, "{exact,rejection,block}",
+        string_format("draft verification: 'exact' accepts a draft token when it matches the target sample, 'rejection' "
+                      "samples drafts from the draft distribution q and accepts with prob min(1, p/q) (lossless, more "
+                      "accepted tokens at temp > 0; MTP and DFlash2 drafts), 'block' samples like 'rejection' and accepts "
+                      "the draft by one joint test over all positions (block verification, lossless, at least as many "
+                      "accepted tokens as 'rejection') (default: %s)",
+                      params.speculative.accept_block ? "block" : params.speculative.accept_rejection ? "rejection" : "exact"),
+        [](common_params & params, const std::string & value) {
+            if (value == "exact") {
+                params.speculative.accept_rejection = false;
+                params.speculative.accept_block     = false;
+            } else if (value == "rejection") {
+                params.speculative.accept_rejection = true;
+                params.speculative.accept_block     = false;
+            } else if (value == "block") {
+                params.speculative.accept_rejection = true;
+                params.speculative.accept_block     = true;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_ACCEPT"));
+    add_opt(common_arg(
+        {"--spec-draft-temp"}, "T",
+        string_format("temperature of the draft distribution for --spec-accept rejection (default: %.2f)", (double) params.speculative.draft_temp),
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft_temp = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_TEMP"));
+    add_opt(common_arg(
+        {"--spec-draft-top-p"}, "P",
+        string_format("nucleus truncation of the draft distribution for --spec-accept rejection/block: sample each draft "
+                      "token from the smallest set of draft candidates with probability >= P (lossless) (default: %.2f, 1.0 = off)",
+                      (double) params.speculative.draft_top_p),
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft_top_p = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_TOP_P"));
+    add_opt(common_arg(
         {"--spec-draft-p-min", "--draft-p-min"}, "P",
         string_format("minimum speculative decoding probability (greedy) (default: %.2f)", (double)params.speculative.draft.p_min),
         [](common_params & params, const std::string & value) {
@@ -4289,6 +4328,53 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_SAMPLING"));
+    add_opt(common_arg(
+        {"--spec-draft-head-type"}, "TYPE",
+        "keep a requantized copy of the LM head for the MTP draft context only (drafts with this copy,\n"
+        "verifies with the full-precision head). allowed values: q4_0, q4_1, q5_0, q5_1, q8_0, none\n"
+        "(default: none)",
+        [](common_params & params, const std::string & value) {
+            if (value == "none" || value.empty()) {
+                params.speculative.draft.head_type = GGML_TYPE_COUNT;
+                return;
+            }
+            ggml_type type = GGML_TYPE_COUNT;
+            for (const auto & t : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
+                if (value == ggml_type_name(t)) {
+                    type = t;
+                    break;
+                }
+            }
+            if (type == GGML_TYPE_COUNT) {
+                throw std::invalid_argument("invalid draft head type: " + value);
+            }
+            params.speculative.draft.head_type = type;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_HEAD_TYPE"));
+    add_opt(common_arg(
+        {"--spec-draft-vocab"}, "N",
+        "MTP draft head scores only the token ids [0, N) (BPE ids are roughly in frequency order), which\n"
+        "cuts its LM head read; verification keeps the full vocabulary, so output is unchanged\n"
+        "(default: 0 = full vocabulary)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--spec-draft-vocab must be >= 0");
+            }
+            params.speculative.draft.n_vocab = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_VOCAB"));
+    add_opt(common_arg(
+        {"--spec-draft-rerank-k"}, "K",
+        "rescore the top-K cheap-head draft candidates with the full head (default: 0 = off).\n"
+        "only affects MTP drafts using --spec-draft-head-type; target verification is unchanged",
+        [](common_params & params, const std::string & value) {
+            const int k = std::stoi(value);
+            if (k < 0 || k > 256) {
+                throw std::invalid_argument("rerank k must be in [0, 256]");
+            }
+            params.speculative.draft.rerank_k = k;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_RERANK_K"));
     add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)\n"

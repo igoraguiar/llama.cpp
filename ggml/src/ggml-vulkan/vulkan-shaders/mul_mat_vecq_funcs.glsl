@@ -365,6 +365,28 @@ vec2 get_dm_scale(uint ib, uint iqs) {
     return FLOAT_TYPEV2(data_a_packed32[ib_k].dm) * FLOAT_TYPEV2(scale_dm);
 }
 
+#define MMVQ_UNPACK_A
+#define MMVQ_UNPACK_A_MIN
+// one 32-value sub-block (one q8_1 block): its 8 packed int8 words, and (d * scale, dmin * min), so the driver
+// unpacks it once for every column of a multi-column (speculative verify) batch
+void mmvq_unpack_a(const uint ib_a, out int32_t a_qs[8], out vec2 a_dm) {
+    const uint ib_k = ib_a / 8;
+    const uint is = ib_a % 8;
+    const uint qs_base = (is / 2) * 8;
+    const uint qs_shift = (is % 2) * 4;
+
+    [[unroll]] for (uint w = 0; w < 8; ++w) {
+#if defined(DATA_A_Q4_K)
+        a_qs[w] = int32_t((data_a_packed32[ib_k].qs[qs_base + w] >> qs_shift) & 0x0F0F0F0F);
+#else
+        a_qs[w] = int32_t(((data_a_packed32[ib_k].qs[qs_base + w] >> qs_shift) & 0x0F0F0F0F) |
+                          (((data_a_packed32[ib_k].qh[w] >> is) & 0x01010101) << 4));
+#endif
+    }
+
+    a_dm = vec2(get_dm_scale(ib_a, 0));
+}
+
 FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
     int32_t q_sum = 0;
 
@@ -448,7 +470,199 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
 }
 #endif
 
+#if defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S)
+#define MMVQ_SIGN_TABLE
+#if defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ3_XXS)
+// indexed by the 7 stored sign bits, the 8th sign is their parity
+#define SIGN_TABLE_SIZE 128
+#else
+#define SIGN_TABLE_SIZE 256
+#endif
+// 8 sign bits -> two words with 0xFF in each byte whose value is negated
+shared uvec2 sign_masks[SIGN_TABLE_SIZE];
+
+uint spread_signs(const uint signs) {
+    const uint s = (signs & 1) | ((signs & 2) << 7) | ((signs & 4) << 14) | ((signs & 8) << 21);
+    return s * 0xFF;
+}
+
+// filled before init_iq_shmem, whose barrier covers both tables
+void init_sign_table() {
+    [[unroll]] for (uint i = 0; i < SIGN_TABLE_SIZE; i += gl_WorkGroupSize.x) {
+        const uint idx = i + gl_LocalInvocationIndex.x;
+        if (SIGN_TABLE_SIZE % gl_WorkGroupSize.x == 0 || idx < SIGN_TABLE_SIZE) {
+#if SIGN_TABLE_SIZE == 128
+            const uint signs = idx | ((bitCount(idx) & 1) << 7);
+#else
+            const uint signs = idx;
+#endif
+            sign_masks[idx] = uvec2(spread_signs(signs), spread_signs(signs >> 4));
+        }
+    }
+}
+
+// apply a sign mask to 4 packed grid bytes. the grid bytes are nonzero (IQ2 8..43, IQ3_XXS 4..62,
+// IQ3_S 1..15), so each negated byte (v ^ 0xFF) + 1 stays below 256 and the packed add never
+// carries into the next byte
+int32_t grid_signed(const uint v, const uint mask) {
+    return int32_t((v ^ mask) + (mask & 0x01010101));
+}
+#endif
+
+#if defined(DATA_A_IQ2_XXS)
+#define MMVQ_UNPACK_A
+// 2-byte loads, IQ2_XXS blocks are 66 bytes. per 32-value sub-block: 4 grid indices, then one
+// 32-bit word of four 7-bit sign groups (8th sign = parity) and a 4-bit scale
+void mmvq_unpack_a(const uint ib_a, out int32_t a_qs[8], out float a_d) {
+    const uint ib_k = ib_a / 8;
+    const uint ib32 = ib_a % 8;
+
+    const uint qs_all = pack32(u16vec2(
+        data_a_packed16[ib_k].qs[4 * ib32],
+        data_a_packed16[ib_k].qs[4 * ib32 + 1]));
+    const uint signscale = pack32(u16vec2(
+        data_a_packed16[ib_k].qs[4 * ib32 + 2],
+        data_a_packed16[ib_k].qs[4 * ib32 + 3]));
+
+    [[unroll]] for (uint g = 0; g < 4; ++g) {
+        const uvec2 m = sign_masks[bitfieldExtract(signscale, 7 * int(g), 7)];
+        const uvec2 grid = iq2xxs_grid[(qs_all >> (8 * g)) & 0xFF];
+
+        a_qs[2 * g    ] = grid_signed(grid.x, m.x);
+        a_qs[2 * g + 1] = grid_signed(grid.y, m.y);
+    }
+
+    a_d = float(data_a_packed16[ib_k].d) * 0.25 * (0.5 + (signscale >> 28));
+}
+#endif
+
+#if defined(DATA_A_IQ2_XS)
+#define MMVQ_UNPACK_A
+#define MMVQ_UNPACK_A_HALF_SCALES
+// IQ2_XS: per 32-value sub-block 4 x (9-bit grid index | 7-bit signs) and one 4-bit scale per
+// 16 values, so the scale comes back per half sub-block
+void mmvq_unpack_a(const uint ib_a, out int32_t a_qs[8], out vec2 a_d) {
+    const uint ib_k = ib_a / 8;
+    const uint ib32 = ib_a % 8;
+
+    [[unroll]] for (uint g = 0; g < 4; ++g) {
+        const uint qs    = uint(data_a_packed16[ib_k].qs[4 * ib32 + g]);
+        const uvec2 m = sign_masks[qs >> 9];
+        const uvec2 grid = iq2xs_grid[qs & 511];
+
+        a_qs[2 * g    ] = grid_signed(grid.x, m.x);
+        a_qs[2 * g + 1] = grid_signed(grid.y, m.y);
+    }
+
+    const float d = float(data_a[ib_k].d);
+    const uint scale = uint(data_a[ib_k].scales[ib32]);
+    a_d = vec2(d * 0.25 * (0.5 + (scale & 0xF)), d * 0.25 * (0.5 + (scale >> 4)));
+}
+#endif
+
+#if defined(DATA_A_IQ2_S)
+#define MMVQ_UNPACK_A
+#define MMVQ_UNPACK_A_HALF_SCALES
+// IQ2_S: per 32-value sub-block 4 grid index low bytes, 2 high bits each in qh, 4 sign bytes in
+// the second half of qs, and one 4-bit scale per 16 values
+void mmvq_unpack_a(const uint ib_a, out int32_t a_qs[8], out vec2 a_d) {
+    const uint ib_k = ib_a / 8;
+    const uint ib32 = ib_a % 8;
+
+    const uint qs_all = pack32(u16vec2(
+        data_a_packed16[ib_k].qs[2 * ib32],
+        data_a_packed16[ib_k].qs[2 * ib32 + 1]));
+    const uint signs_all = pack32(u16vec2(
+        data_a_packed16[ib_k].qs[QUANT_K / 16 + 2 * ib32],
+        data_a_packed16[ib_k].qs[QUANT_K / 16 + 2 * ib32 + 1]));
+    const uint qh = uint(data_a[ib_k].qh[ib32]);
+
+    [[unroll]] for (uint g = 0; g < 4; ++g) {
+        const uint idx   = ((qs_all >> (8 * g)) & 0xFF) | (((qh >> (2 * g)) & 3) << 8);
+        const uvec2 m = sign_masks[(signs_all >> (8 * g)) & 0xFF];
+        const uvec2 grid = iq2s_grid[idx];
+
+        a_qs[2 * g    ] = grid_signed(grid.x, m.x);
+        a_qs[2 * g + 1] = grid_signed(grid.y, m.y);
+    }
+
+    const float d = float(data_a[ib_k].d);
+    const uint scale = uint(data_a[ib_k].scales[ib32]);
+    a_d = vec2(d * 0.25 * (0.5 + (scale & 0xF)), d * 0.25 * (0.5 + (scale >> 4)));
+}
+#endif
+
+#if defined(DATA_A_IQ3_XXS)
+#define MMVQ_UNPACK_A
+// 2-byte loads, IQ3_XXS blocks are 98 bytes. per 32-value sub-block: 8 grid indices, then one
+// 32-bit word of four 7-bit sign groups (8th sign = parity) and a 4-bit scale
+void mmvq_unpack_a(const uint ib_a, out int32_t a_qs[8], out float a_d) {
+    const uint ib_k = ib_a / 8;
+    const uint ib32 = ib_a % 8;
+
+    const uint signscale = pack32(u16vec2(
+        data_a_packed16[ib_k].qs[QUANT_K / 8 + 2 * ib32],
+        data_a_packed16[ib_k].qs[QUANT_K / 8 + 2 * ib32 + 1]));
+
+    [[unroll]] for (uint g = 0; g < 4; ++g) {
+        const uint qs    = uint(data_a_packed16[ib_k].qs[4 * ib32 + g]);
+        const uvec2 m = sign_masks[bitfieldExtract(signscale, 7 * int(g), 7)];
+
+        // grid holds 4 values, one per byte
+        a_qs[2 * g    ] = grid_signed(iq3xxs_grid[qs & 0xFF], m.x);
+        a_qs[2 * g + 1] = grid_signed(iq3xxs_grid[qs >> 8],   m.y);
+    }
+
+    a_d = float(data_a_packed16[ib_k].d) * 0.5 * (0.5 + (signscale >> 28));
+}
+#endif
+
+#if defined(DATA_A_IQ3_S)
+#define MMVQ_UNPACK_A
+// 2-byte loads, IQ3_S blocks are 110 bytes. same unpacking as the IQ3_S MMQ block_a_to_shmem.
+// unpacks one 32-value sub-block to 8 packed int8 words + its scale, so the driver can reuse it
+// for every column of a multi-column (speculative verify) batch
+void mmvq_unpack_a(const uint ib_a, out int32_t a_qs[8], out float a_d) {
+    const uint ib_k = ib_a / 8;
+    const uint ib32 = ib_a % 8;
+
+    // high index bit pairs for the 8 grid indices of this sub-block, and its 32 sign bits
+    const uint qh_all    = uint(data_a_packed16[ib_k].qh[ib32 / 2]) >> ((ib32 & 1) * 8);
+    const uint signs_all = uint(data_a_packed16[ib_k].signs[ib32 * 2]) | (uint(data_a_packed16[ib_k].signs[ib32 * 2 + 1]) << 16);
+
+    [[unroll]] for (uint l = 0; l < 4; ++l) {
+        const uint qs    = uint(data_a_packed16[ib_k].qs[ib32 * 4 + l]);
+        const uint qh    = qh_all >> (2 * l);
+        const uvec2 m = sign_masks[(signs_all >> (8 * l)) & 0xFF];
+
+        // grid holds 4 values of 1..15, one per byte
+        a_qs[2 * l    ] = grid_signed(iq3s_grid[( qs       & 0xFF) | ((qh & 1) << 8)], m.x);
+        a_qs[2 * l + 1] = grid_signed(iq3s_grid[((qs >> 8) & 0xFF) | ((qh & 2) << 7)], m.y);
+    }
+
+    const uint scale = (uint(data_a_packed16[ib_k].scales[ib32 / 4]) >> ((ib32 & 3) * 4)) & 0xF;
+    a_d = float(data_a_packed16[ib_k].d) * float(1 + 2 * scale);
+}
+#endif
+
 #if defined(DATA_A_IQ4_XS)
+#define MMVQ_UNPACK_A
+void mmvq_unpack_a(const uint ib_a, out int32_t a_qs[8], out float a_d) {
+    const uint ib = ib_a / 8;
+    const uint ib32 = ib_a % 8;
+
+    [[unroll]] for (uint j = 0; j < 4; ++j) {
+        const uint32_t vui = data_a_packed32[ib].qs[4 * ib32 + j];
+        const i32vec2 qs_a = iq4nl_to_i8x8(vui);
+        a_qs[j    ] = qs_a.x;
+        a_qs[j + 4] = qs_a.y;
+    }
+
+    const uint sl = (data_a_packed32[ib].scales_l >> (4 * ib32)) & 0xF;
+    const uint sh = (data_a_packed32[ib].scales_h >> (2 * ib32)) & 3;
+    a_d = float(data_a[ib].d) * float(int(sl | (sh << 4)) - 32);
+}
+
 FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
     const uint ib = ib_a / 8;
     const uint ib32 = ib_a % 8;

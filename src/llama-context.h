@@ -96,6 +96,11 @@ struct llama_context {
     ggml_tensor * get_layer_inp_dev() const { return layer_inp_dev; }
     ggml_tensor * get_h_nextn_dev()   const { return h_nextn_dev; }
 
+    bool dflash_inject_features_async(llama_context & tgt, const int32_t * layer_ids, int32_t n_layers, int32_t n_tokens);
+    void dflash_inject_features_clear();
+
+    void flush();
+
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 
@@ -136,6 +141,8 @@ struct llama_context {
     // state rows read from the h_nextn device buffer of ctx_src, see llama_set_ctx_state_src()
     bool set_ctx_state_src(llama_context * ctx_src);
     bool supports_state_row() const;
+
+    void set_embeddings_layer_inp_host_min_tokens(int32_t n_tokens) { layer_inp_host_min_tokens = n_tokens; }
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
 
@@ -323,6 +330,9 @@ private:
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
 
+    // create the draft-only low-bit copy of the LM head (MTP draft contexts)
+    bool init_draft_head(enum ggml_type type);
+
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
     size_t state_read_data (llama_io_read_i  & io);
@@ -345,6 +355,12 @@ private:
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
+
+    // draft-only low-bit copy of the LM head (MTP draft contexts only)
+    ggml_tensor * draft_head = nullptr;
+
+    ggml_context * draft_head_ctx = nullptr;
+    ggml_backend_buffer_t draft_head_buf = nullptr;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
@@ -455,6 +471,18 @@ private:
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+
+    // draft contexts alternate between two graph shapes (target features / catch-up, and the draft itself);
+    // a second scheduler keeps the other graph allocated so neither is rebuilt per step. with graph_alt the
+    // front graph lives in gf_res_prev[0] (with sched) and the parked one in gf_res_alt (with sched_alt)
+    bool                   graph_alt = false;
+
+    // layer input embeddings are copied to the host only for batches of more tokens than this
+    int32_t layer_inp_host_min_tokens = 0;
+    ggml_backend_sched_ptr sched_alt;
+
+    llm_graph_result_ptr   gf_res_alt;
+    llm_graph_result *     gf_res_alt_active = nullptr;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

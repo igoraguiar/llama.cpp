@@ -183,6 +183,16 @@ struct vk_op_dsv4_hc_comb_push_constants {
     uint32_t n_iter;
 };
 
+// dflash_conv.comp: DFlash2 block convolution
+struct vk_op_dflash_conv_push_constants {
+    uint32_t C, T, K, G, B;
+    uint32_t nbx1;
+    uint32_t nbd1, nbd2;
+    uint32_t nbb1;
+    uint32_t nbo1;
+    uint32_t x_offset, d_offset, b_offset, o_offset;
+};
+
 struct vk_op_dsv4_hc_pre_push_constants {
     uint32_t n_embd;
     uint32_t n_tokens;
@@ -730,7 +740,23 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t neq1, rq3;
     float scale;
     uint32_t K;
+    // external snapshot target (ggml_gated_delta_net_snap): n_snap == 0 writes snapshots to dst
+    uint32_t n_snap, snap_seq_stride, snap_slot_stride;
+    // state_row != 0: the state binding is the recurrent cache, a sequence's state starts at row idx[seq] (rows of
+    // state_row floats) instead of being a gathered [D, n_seqs] copy
+    uint32_t state_row;
+    // gated_delta_net_replay: log entry floats and count; log_row != 0: the state and log bindings are the caches (log
+    // rows of log_row floats, state rows of state_row floats, the new state written at state_w_off), else the log is a
+    // [log_E, log_R, n_seqs] source and the new state and log go to dst at s_off and log_out_off
+    uint32_t log_E, log_R, log_row, log_out_off;
+    uint32_t state_w_off;
+    // first element of the state rows, log read rows, log write rows and replay counts in their bindings
+    uint32_t idx_off, log_r_off, log_w_off, nrep_off;
+    // qk_eps > 0: q and k are the inputs of the delta-net L2 norm (rms_norm with eps qk_eps, then * qk_scale), done in the kernel
+    float qk_eps, qk_scale;
 };
+
+static_assert(sizeof(vk_op_gated_delta_net_push_constants) <= 128);
 
 struct vk_op_ssm_scan_push_constants {
     uint32_t nb02, nb03, nb12, nb13;
@@ -746,6 +772,16 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nb11;
     uint32_t dst_nb0, dst_nb1, dst_nb2;
     uint32_t nc, ncs, nr, n_t, n_s;
+};
+
+// ssm_conv_state.comp: conv of a recurrent layer with its cache state path fused
+struct vk_op_ssm_conv_state_push_constants {
+    uint32_t nr, n_t, n_s, row;
+    uint32_t xs1, xs2, ds1, ds2, ks1;
+    uint32_t n_snap;
+    uint32_t snap_src0, snap_src1;
+    uint32_t snap_row[8];
+    uint32_t orbit, sync;
 };
 
 struct vk_op_conv2d_push_constants {
@@ -974,6 +1010,15 @@ template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * 
     p.s_offset = get_misalign_bytes(ctx, src1) / ggml_type_size(src1->type);
     p.b_offset = get_misalign_bytes(ctx, src2) / ggml_type_size(src2->type);
     p.d_offset = get_misalign_bytes(ctx, dst)  / ggml_type_size(dst->type);
+
+    GGML_UNUSED(src3);
+}
+
+template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_dflash_conv_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
+    p.x_offset = get_misalign_bytes(ctx, src0) / ggml_type_size(src0->type);
+    p.d_offset = get_misalign_bytes(ctx, src1) / ggml_type_size(src1->type);
+    p.b_offset = get_misalign_bytes(ctx, src2) / ggml_type_size(src2->type);
+    p.o_offset = get_misalign_bytes(ctx, dst)  / ggml_type_size(dst->type);
 
     GGML_UNUSED(src3);
 }

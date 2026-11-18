@@ -251,6 +251,12 @@ public:
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
 
+    // positions for a causal mask built on the device (f16, relative to the lowest position in the batch): kv_dst [n_kv]
+    // per cell (2048 when empty or of another sequence), q_dst [n_tokens] per token + 1
+    void set_input_kq_pos(ggml_tensor * kv_dst, ggml_tensor * q_dst, const llama_ubatch * ubatch) const;
+
+    void set_input_k_rot(ggml_tensor * dst) const;
+    void set_input_v_rot(ggml_tensor * dst) const;
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
 
@@ -310,6 +316,12 @@ private:
     llama_memory_bufs attn_rot_bufs;
 
     void init_rotation(const char * name_tag);
+    // device copies of the K and V rotation matrices, when the whole cache is in one buffer type; the graphs read them
+    // in place instead of uploading them as inputs every time
+    ggml_context_ptr        ctx_rot;
+    ggml_backend_buffer_ptr buf_rot;
+    ggml_tensor *           rot_k = nullptr;
+    ggml_tensor *           rot_v = nullptr;
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
@@ -456,6 +468,10 @@ public:
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
 
+    void set_input_kq_pos(ggml_tensor * kv_dst, ggml_tensor * q_dst, const llama_ubatch * ubatch) const;
+
+    void set_input_k_rot(ggml_tensor * dst) const;
+    void set_input_v_rot(ggml_tensor * dst) const;
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 

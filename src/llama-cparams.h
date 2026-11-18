@@ -21,6 +21,20 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
 
+    // draft-only low-bit copy of the LM head (MTP draft contexts only; nullptr = disabled)
+    ggml_tensor * draft_head = nullptr;
+
+    // MTP draft context: score only token ids [0, draft_n_vocab) (0 = full vocabulary)
+    int32_t draft_n_vocab = 0;
+
+    // DFlash draft context: the next feature-injection decode reads the target features directly from these
+    // target-context tensors (the inputs of the target layers, one ubatch, on the same device) instead of the batch
+    static constexpr int DFLASH_MAX_SRC = 8;
+    int32_t              dflash_n_src = 0;
+    struct ggml_tensor * dflash_src[DFLASH_MAX_SRC]      = {};
+    void *               dflash_src_data[DFLASH_MAX_SRC] = {};
+    void *               dflash_src_buf[DFLASH_MAX_SRC]  = {};
+
     float rope_freq_base;
     float rope_freq_scale;
 

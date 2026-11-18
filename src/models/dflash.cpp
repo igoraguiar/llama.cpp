@@ -465,7 +465,14 @@ ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tok
 }
 
 ggml_tensor * llama_model_dflash::graph_base::build_logits(ggml_tensor * cur) {
-    const auto [output, output_s] = get_lm_head(*this, model);
+    auto [output, output_s] = get_lm_head(*this, model);
+
+    // DFlash2 with --spec-draft-vocab N: score only token ids [0, N) through a view of the head rows. The
+    // selector draws its candidates from these ids; verification keeps the full vocabulary
+    const int32_t draft_n_vocab = cparams.draft_n_vocab;
+    if (model.dflash_selector_hidden && !model.d2t && draft_n_vocab > 0 && draft_n_vocab < output->ne[1]) {
+        output = ggml_view_2d(ctx0, output, output->ne[0], draft_n_vocab, output->nb[1], 0);
+    }
     cur = build_lora_mm(output, cur, output_s);
 
     // DFlash2 feeds these logits to the selector, so they need the target's output

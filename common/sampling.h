@@ -5,6 +5,7 @@
 #include "common.h"
 
 #include <string>
+#include <random>
 #include <vector>
 
 // common_sampler extends llama_sampler with additional functionality:
@@ -85,11 +86,60 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 //
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false);
 
-// as above, but verifies by rejection sampling; draft_q holds the draft's candidates per token
-std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first = false);
+// as above, but verifies by rejection sampling (lossless); draft_q holds the draft's candidates per token
+//
+// - the draft token draft[i] was sampled from the draft distribution draft_q[i] (ids + probs)
+// - it is accepted with probability min(1, p(x)/q(x)), where p is the target distribution after the sampler chain
+// - on rejection, a token is sampled from norm(max(0, p - q)) and the verification stops
+// - the emitted tokens are distributed exactly as when sampling from p token by token
+//
+// falls back to common_sampler_sample_and_accept_n when the sampler does not support it
+// (see common_sampler_supports_rejection) or when draft_q does not cover the draft
+// is_replay: the draft is a prefix already accepted before a checkpoint restore - accept it as is
+//
+// block: block verification instead (Sun et al. 2024, "Block Verification Accelerates Speculative Decoding", Alg. 2):
+// the draft block is accepted by one joint test over all positions, also lossless, and never accepts fewer tokens in
+// expectation than the token-by-token test. Needs the target distribution at every draft position, evaluated on a
+// clone of the sampler advanced along the draft.
+std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(
+        struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft,
+        const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first = false, bool is_replay = false, bool block = false);
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
+
+// block verification of a draft x[0..n-1], x[k] ~ q[k]: p[k] is the target distribution at draft position k (p
+// normalized, sparse), conditioned on x[0..k-1]. Fills the prefix weights w[0..n] (w[0] = 1,
+// w[k+1] = min(w[k] p[k](x[k]) / q[k](x[k]), 1)) and the accept thresholds h[1..n] (h[0] unused): with independent
+// uniforms eta_k, the accepted length is the largest k with eta_k <= h[k] (0 if there is none).
+void common_spec_block_plan(const std::vector<std::vector<llama_token_data>> & p,
+        const std::vector<std::vector<llama_token_data>> & q, const llama_tokens & x, size_t n,
+        std::vector<double> & h, std::vector<double> & w);
+
+// weights (unnormalized, over the candidates of p[tau]) of the token that follows tau accepted draft tokens:
+// max(w[tau] p[tau] - q[tau], 0) for tau < n, p[n] (the bonus position) for tau == n
+void common_spec_block_residual(const std::vector<std::vector<llama_token_data>> & p,
+        const std::vector<std::vector<llama_token_data>> & q, const std::vector<double> & w, size_t n, size_t tau,
+        std::vector<llama_token_data> & r);
+
+// one rejection-sampling step: p = cur_p (probs, need not be normalized), x ~ q
+// returns x with accepted = true, or a token from norm(max(0, p - q)) with accepted = false,
+// or LLAMA_TOKEN_NULL if p is degenerate
+llama_token common_spec_rejection_step(const llama_token_data_array & cur_p, llama_token x,
+        const std::vector<llama_token_data> & q, std::mt19937 & rng, bool & accepted);
+
+// true if the sampler chain yields an explicit distribution p that can be used for rejection sampling
+// (temp > 0, no grammar constraining the tokens, no mirostat/xtc/adaptive-p)
+bool common_sampler_supports_rejection(const struct common_sampler * gsmpl);
+
+// true if backend sampling was requested and can be used for the next decode: no grammar constrains the tokens
+// (a lazy grammar does not until its trigger). Callers that attach the backend sampler re-check it before each
+// decode; a verification stops at the token where a grammar starts constraining.
+bool common_sampler_backend_ok(const struct common_sampler * gsmpl);
+
+// after detaching the backend sampler (llama_set_sampler with NULL): the chain runs on the CPU for the rest of the
+// request and common_sampler_backend_ok() stays false (a chain cannot be attached twice)
+void common_sampler_backend_release(struct common_sampler * gsmpl);
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
@@ -132,3 +182,23 @@ struct common_sampler_deleter {
 };
 
 typedef std::unique_ptr<common_sampler, common_sampler_deleter> common_sampler_ptr;
+
+// speculative decoding diagnostics, enabled with env LLAMA_SPEC_STATS=1 (off: all calls are no-ops)
+// records the draft distribution q per drafted position, then at verify time compares the exact-match
+// acceptance p(draft) against the lossless rejection-sampling acceptance sum_x min(p(x), q(x))
+enum common_spec_stats_time {
+    COMMON_SPEC_STATS_T_DRAFT  = 0,
+    COMMON_SPEC_STATS_T_DECODE = 1,
+    COMMON_SPEC_STATS_T_ACCEPT = 2,
+    COMMON_SPEC_STATS_T_COUNT,
+};
+
+bool common_spec_stats_enabled();
+// q of the draft at draft position pos, from the draft sampler candidates (softmax of their logits at temp 1)
+void common_spec_stats_set_draft_q(int pos, const llama_token_data_array * cur_p);
+void common_spec_stats_set_replay(bool is_replay);
+void common_spec_stats_add_time(enum common_spec_stats_time kind, double ms);
+// counts one completed generation cycle and prints the cumulative summary every N cycles
+void common_spec_stats_end_cycle();
+// LLAMA_SPEC_TRACE=N: host timeline of the spec loop; prints the mean time between consecutive marks every N cycles
+void common_spec_trace(const char * label);

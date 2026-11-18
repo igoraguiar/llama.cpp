@@ -272,17 +272,6 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
     return { qkv_mixed, z };
 }
 
-ggml_tensor * llama_model_qwen35::graph::build_norm_gated(
-        ggml_tensor * input,
-        ggml_tensor * weights,
-        ggml_tensor * gate,
-        int           layer) {
-    ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
-    ggml_tensor * gated_silu = ggml_silu(ctx0, gate);
-
-    return ggml_mul(ctx0, normalized, gated_silu);
-}
-
 ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
         llm_graph_input_attn_kv * inp,
         ggml_tensor *             cur,
@@ -324,6 +313,15 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
     cb(gate, "gate_reshaped", il);
 
+    ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
+    cb(gate_sigmoid, "gate_sigmoid", il);
+
+    // the Q norm, K norm and gate do not depend on each other: add them to the graph together so they can
+    // run as one batch (in graph order the K norm and the gate land after the Q RoPE and the attention)
+    ggml_build_forward_expand(gf, Qcur);
+    ggml_build_forward_expand(gf, Kcur);
+    ggml_build_forward_expand(gf, gate_sigmoid);
+
     Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
     // Apply MRoPE
@@ -341,9 +339,6 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
                 nullptr, nullptr, nullptr,
                 Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     cb(cur, "attn_pregate", il);
-
-    ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
-    cb(gate_sigmoid, "gate_sigmoid", il);
 
     cur = ggml_mul(ctx0, cur, gate_sigmoid);
     cb(cur, "attn_gated", il);
@@ -372,7 +367,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     GGML_ASSERT(ubatch.equal_seqs());
     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
 
-    // Input projections
+    // Input projections. All four read cur: add them to the graph together so they can run as one batch
+    // (the small alpha/beta projections otherwise land next to later, dependent ops)
     auto qkvz = build_qkvz(cur, il);
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
@@ -394,9 +390,13 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
         alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
         alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     }
-    cb(beta, "beta", il);
+
+    cb(beta,  "beta",  il);
     cb(alpha, "alpha", il);
 
+    // the gate prep on the 2D projection outputs, each node right after its projection so a backend can run it in
+    // the projection's epilogue (Vulkan: mat-vec + activation, mat-vec + bias + softplus + scale):
+    // sigmoid(beta), softplus(alpha + dt) * A (-A_log.exp() * softplus), and silu(z) of the gated output norm
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "beta_sigmoid", il);
 
@@ -404,9 +404,18 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
     cb(alpha_softplus, "a_softplus", il);
 
-    ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
+    ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);
     cb(gate, "gate", il);
 
+    ggml_tensor * z_silu = ggml_silu(ctx0, z);
+
+    // the small alpha/beta projections first: issued after the large ones they start late and end the batch
+    ggml_build_forward_expand(gf, gate);
+    ggml_build_forward_expand(gf, beta);
+    ggml_build_forward_expand(gf, qkv_mixed);
+    ggml_build_forward_expand(gf, z_silu);
+
+    beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
 
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
@@ -418,7 +427,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    ggml_tensor * state = build_recurrent_state(inp, ssm_states_all, il);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
@@ -460,8 +469,19 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    // q and k are adjacent in the conv output: one L2 norm over both heads halves the small
+    // dispatches (RMS_NORM + SCALE) per layer; q and k are views of its output with equal strides
+    ggml_tensor * qk_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, 2 * num_k_heads, n_seq_tokens, n_seqs,
+            ggml_row_size(conv_qkv_mix->type, head_k_dim),
+            nb1_qkv,
+            nb1_qkv * n_seq_tokens,
+            0);
+    qk_conv = build_gdn_l2_norm(ctx0, qk_conv, eps_norm);
+
+    q_conv = ggml_view_4d(ctx0, qk_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+            qk_conv->nb[1], qk_conv->nb[2], qk_conv->nb[3], 0);
+    k_conv = ggml_view_4d(ctx0, qk_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+            qk_conv->nb[1], qk_conv->nb[2], qk_conv->nb[3], num_k_heads * qk_conv->nb[1]);
 
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
@@ -474,13 +494,13 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
-    ggml_tensor * z_2d = ggml_view_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
-            ggml_row_size(z->type, head_v_dim), z->nb[1], z->nb[1] * n_seq_tokens, 0);
+    ggml_tensor * z_silu_4d = ggml_reshape_4d(ctx0, z_silu, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
 
-    // Apply gated normalization: self.norm(core_attn_out, z)
-    ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
+    // Apply gated normalization: self.norm(core_attn_out, z) = rms_norm(core_attn_out) * silu(z)
+    ggml_tensor * attn_out_norm = ggml_mul(ctx0, build_norm(output, model.layers[il].ssm_norm, nullptr, LLM_NORM_RMS, il), z_silu_4d);
 
-    // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * head_dim , n_tokens * n_seqs ]
+    // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * head_dim, n_tokens * n_seqs]
+    // 2D, so the projection output feeds the residual add directly (backends can fuse the add)
     ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs);
     cb(final_output, "final_output", il);
 
@@ -662,7 +682,20 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
+
+    // draft-only low-bit head: the draft context drafts with a cheap requantized copy of the
+    // head while the target context keeps verifying with the full-precision one
+    const int64_t draft_n_vocab = params.cparams.draft_n_vocab;
+    if (params.cparams.draft_head != nullptr && cur->ne[1] == 1) {
+        cur = build_lora_mm(params.cparams.draft_head, cur, nullptr);
+    } else if (draft_n_vocab > 0 && draft_n_vocab < head_w->ne[1] && cur->ne[1] == 1) {
+        // reduced-vocabulary draft: score only the first draft_n_vocab rows of the head. drafts never
+        // propose the rarer ids, verification keeps the full vocabulary (lossless with rejection)
+        ggml_tensor * head_sub = ggml_view_2d(ctx0, head_w, head_w->ne[0], draft_n_vocab, head_w->nb[1], 0);
+        cur = build_lora_mm(head_sub, cur, head_s);
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;

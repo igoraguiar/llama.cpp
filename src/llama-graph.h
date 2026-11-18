@@ -49,6 +49,8 @@ enum llm_graph_type {
 enum llm_fused_op {
     LLM_FUSED_OP_FLASH_ATTN,
     LLM_FUSED_OP_FLASH_ATTN_KV_ROWS,
+    LLM_FUSED_OP_GDN_AR,
+    LLM_FUSED_OP_GDN_CH,
     LLM_FUSED_OP_LIGHTNING_INDEXER,
     LLM_FUSED_OP_DSV4_HC_PRE,
     LLM_FUSED_OP_DSV4_HC_COMB,
@@ -309,6 +311,21 @@ public:
     ggml_tensor * s_copy_main; // I32 [n_seqs]
     ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
 
+    // reversed rollback slot ids [K-1, ..., 0] (K = n_rs_seq + 1), created on demand by
+    // build_conv_state so the K per-layer conv-state snapshot copies become one SET_ROWS
+    ggml_tensor * rs_rev_idx = nullptr; // I32 [K]
+
+    // delta-net update logs (llama_memory_recurrent::n_embd_log > 0): I32 [n_rs, 4], per cell the state row, the log
+    // read row, the log write row and the log entries to replay; with views of the processed and the copied cells
+    ggml_tensor * s_log = nullptr;
+    ggml_tensor * s_log_state_main  = nullptr; // I32 [n_seqs]
+    ggml_tensor * s_log_state_extra = nullptr; // I32 [n_rs - n_seqs]
+    ggml_tensor * s_log_r_main      = nullptr;
+    ggml_tensor * s_log_r_extra     = nullptr;
+    ggml_tensor * s_log_w_main      = nullptr;
+    ggml_tensor * s_log_w_extra     = nullptr;
+    ggml_tensor * s_log_n           = nullptr; // I32 [n_seqs]
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse
@@ -383,6 +400,10 @@ public:
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
     llm_attn_mask self_attn_mask;
+
+    // positions of a causal mask built on the device instead of self_kq_mask
+    ggml_tensor * kq_pos_kv = nullptr; // F16 [n_kv, 1]
+    ggml_tensor * kq_pos_q  = nullptr; // F16 [1, n_batch]
 
     // note: assumes v_rot^2 == I
     std::vector<ggml_tensor *> self_k_rot;
@@ -789,6 +810,8 @@ class llm_graph_result;
 struct llm_graph_params {
     const llama_model * model = nullptr;
 
+    llm_arch arch = LLM_ARCH_UNKNOWN;
+
     llama_hparams hparams;
     llama_cparams cparams;
 
@@ -839,6 +862,18 @@ struct llm_graph_params {
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
+    static bool dflash_src_equal(const llama_cparams & a, const llama_cparams & b) {
+        if (a.dflash_n_src != b.dflash_n_src) {
+            return false;
+        }
+        for (int i = 0; i < a.dflash_n_src; ++i) {
+            if (a.dflash_src[i] != b.dflash_src[i] || a.dflash_src_data[i] != b.dflash_src_data[i] || a.dflash_src_buf[i] != b.dflash_src_buf[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     bool allow_reuse(const llm_graph_params & other) const {
         // first check the ubatch
         bool can_reuse_ubatch =
@@ -911,6 +946,8 @@ struct llm_graph_params {
             h_nextn_dev   == other.h_nextn_dev   &&
             h_nextn_src   == other.h_nextn_src   &&
             model == other.model &&
+            dflash_src_equal(cparams, other.cparams) &&
+            arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
